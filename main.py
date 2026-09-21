@@ -124,6 +124,8 @@ _ON_OFF_FALSE = {"关", "off", "否", "0", "false", "停用", "no"}
 _OFF_WORDS = {"关", "off", "关闭", "取消", "无", "none", "clear"}
 # 密钥池专用的清空词（刻意不含 "0" / "无"，避免把内容恰为这些字符的密钥误清空）
 _KEY_CLEAR_WORDS = {"清空", "clear", "重置", "reset"}
+# 只读的「查看」类输入：私聊里省略群号时可以安全地套用默认群
+_KEY_VIEW_WORDS = {"查看", "list", "ls", "详情"}
 
 
 def _parse_on_off(text: str) -> bool:
@@ -490,7 +492,9 @@ class GroupLotteryPlugin(Star):
         if groups is not None:
             if group_id not in groups:
                 raise ValueError(
-                    f"机器人不在群 {group_id} 里（或群号有误），无法在该群发布抽奖。",
+                    f"机器人不在群 {group_id} 里（或群号有误）。\n"
+                    "私聊里的写法是：抽奖 <子命令> <群号> …，"
+                    "例如「抽奖 名额 888888 3」" + self._recent_group_hint(event),
                 )
             return groups.get(group_id) or ""
 
@@ -503,8 +507,20 @@ class GroupLotteryPlugin(Star):
             "请先在该群里发送一次「抽奖 发布 <奖品名>」，之后就能从私聊按群号管理了。",
         )
 
+    def _recent_group_hint(self, event: AstrMessageEvent) -> str:
+        """生成「你最近操作过这些群」的提示，帮管理员补上群号。"""
+        rows = self.db.recent_groups_by(str(event.get_sender_id()))
+        if not rows:
+            return ""
+        listed = "、".join(str(r.get("group_id")) for r in rows)
+        return f"\n\n你最近发布过抽奖的群：{listed}"
+
     async def _target(
-        self, event: AstrMessageEvent, tail: str
+        self,
+        event: AstrMessageEvent,
+        tail: str,
+        *,
+        allow_default: bool = False,
     ) -> tuple[str, str, str, str]:
         """解析本次操作的目标群与剩余参数。
 
@@ -514,6 +530,8 @@ class GroupLotteryPlugin(Star):
         Args:
             event: 当前消息事件。
             tail: 子命令之后的原始文本。
+            allow_default: 私聊里省略群号时，是否套用「该管理员最近发布的那一场」
+                所在的群。只对只读命令开启，避免误伤。
 
         Returns:
             ``(umo, 群号, 群名, 剩余参数)``。
@@ -526,15 +544,30 @@ class GroupLotteryPlugin(Star):
             return umo, group_id_of(umo), "", (tail or "").strip()
 
         group_id, body = _take_group_id(tail)
+
+        # 私聊里把「查看」当群号写是常见笔误：识别出来当作省略群号处理
+        if group_id in _KEY_VIEW_WORDS or group_id in _KEY_CLEAR_WORDS:
+            body = (tail or "").strip()
+            group_id = ""
+
+        if not group_id and allow_default:
+            fallback = self.db.latest_raffle_by(str(event.get_sender_id()))
+            if fallback:
+                group_id = str(fallback.get("group_id") or "")
+
         if not group_id:
             raise ValueError(
                 "私聊里请先写群号，例如：\n"
                 "抽奖 发布 123456 月卡 3\n"
                 "抽奖 密钥 123456\n（下一行起粘贴密钥）\n"
-                "抽奖 开奖 123456",
+                "抽奖 开奖 123456" + self._recent_group_hint(event),
             )
         if not group_id.isdigit():
-            raise ValueError(f"群号必须是纯数字，收到的是「{group_id}」")
+            raise ValueError(
+                f"群号必须是纯数字，收到的是「{group_id}」。\n"
+                "私聊里的写法是：抽奖 <子命令> <群号> …，例如「抽奖 密钥 123456 查看」"
+                + self._recent_group_hint(event),
+            )
 
         group_name = await self._ensure_bot_in_group(event, group_id)
         umo = f"{event.get_platform_id()}:GroupMessage:{group_id}"
@@ -552,7 +585,9 @@ class GroupLotteryPlugin(Star):
         self, event: AstrMessageEvent, tail: str
     ) -> AsyncGenerator[Any, None]:
         """查看指定群当前抽奖状态。"""
-        umo, group_id, group_name, _body = await self._target(event, tail)
+        umo, group_id, group_name, _body = await self._target(
+            event, tail, allow_default=True
+        )
         raffle = self._open_raffle(umo)
         if not raffle:
             yield event.plain_result(
@@ -582,7 +617,9 @@ class GroupLotteryPlugin(Star):
         self, event: AstrMessageEvent, tail: str
     ) -> AsyncGenerator[Any, None]:
         """查看指定群的报名名单。"""
-        umo, group_id, _group_name, _body = await self._target(event, tail)
+        umo, group_id, _group_name, _body = await self._target(
+            event, tail, allow_default=True
+        )
         raffle = self._open_raffle(umo)
         if not raffle:
             yield event.plain_result(f"群 {group_id} 当前没有进行中的抽奖。")
@@ -847,9 +884,21 @@ class GroupLotteryPlugin(Star):
         一律拒绝并尝试撤回。
 
         私聊写法：``抽奖 密钥 <群号>``，下一行起粘贴密钥。
+
+        私聊里省略群号时，「查看」会套用最近发布的那一场（只读，安全）；
+        但「清空」是破坏性操作，必须写明群号。
         """
         from_private = event.is_private_chat()
-        umo, group_id, group_name, body = await self._target(event, tail)
+        # 先偷看一眼：只有「查看」类输入才允许省略群号
+        peek_head, peek_body = _take_group_id(tail) if from_private else ("", "")
+        view_like = (
+            peek_body in _KEY_VIEW_WORDS
+            or peek_head in _KEY_VIEW_WORDS
+            or (not peek_head and not peek_body)
+        )
+        umo, group_id, group_name, body = await self._target(
+            event, tail, allow_default=view_like
+        )
 
         if (
             not from_private

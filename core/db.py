@@ -269,6 +269,34 @@ class LotteryDB:
             (umo, STATUS_OPEN),
         )
 
+    def latest_raffle_by(self, created_by: str) -> dict[str, Any] | None:
+        """取某位管理员最近发布的一场抽奖。
+
+        私聊里省略群号时用它兜底：管理员刚操作过的那场通常就是他想继续操作的。
+        """
+        if not created_by:
+            return None
+        return self._query_one(
+            "SELECT * FROM raffles WHERE created_by = ? ORDER BY id DESC LIMIT 1",
+            (str(created_by),),
+        )
+
+    def recent_groups_by(self, created_by: str, limit: int = 5) -> list[dict[str, Any]]:
+        """列出某位管理员最近发布过抽奖的群（按最近一次操作排序）。
+
+        用于在私聊里给出「你最近操作过这些群」的提示。
+        """
+        if not created_by:
+            return []
+        return self._query(
+            """
+            SELECT group_id, MAX(id) AS last_id, COUNT(*) AS total
+            FROM raffles WHERE created_by = ?
+            GROUP BY group_id ORDER BY last_id DESC LIMIT ?
+            """,
+            (str(created_by), max(1, int(limit))),
+        )
+
     def update_raffle(self, raffle_id: int, **fields: Any) -> None:
         """更新抽奖字段（仅白名单字段生效）。"""
         clean = {k: v for k, v in fields.items() if k in _UPDATABLE_RAFFLE_FIELDS}

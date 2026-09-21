@@ -498,19 +498,69 @@ def test_private_key_setup_requires_global_admin(plugin: GroupLotteryPlugin):
 def test_private_key_setup_validates_group_id(plugin: GroupLotteryPlugin):
     run(send(plugin, admin_event("抽奖 发布 月卡")))
 
-    # 没写群号
-    assert "私聊里请先写群号" in texts_of(
-        run(send(plugin, private_admin_event("抽奖 密钥")))
-    )
     # 群号不是数字
-    assert "群号必须是纯数字" in texts_of(
-        run(send(plugin, private_admin_event("抽奖 密钥 abc\nAAA")))
-    )
+    out = texts_of(run(send(plugin, private_admin_event("抽奖 密钥 abc\nAAA"))))
+    assert "群号必须是纯数字" in out
+    assert "你最近发布过抽奖的群：888888" in out
     # 机器人不在该群
     assert "机器人不在群 999999 里" in texts_of(
         run(send(plugin, private_admin_event("抽奖 密钥 999999\nAAA")))
     )
     assert plugin.db.count_keys(1) == 0
+
+
+def test_private_keys_view_without_group_id(plugin: GroupLotteryPlugin):
+    """私聊里「抽奖 密钥 查看」漏了群号 —— 不该报「群号必须是纯数字」。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 2")))
+    set_keys(plugin, "KEY-AAA\nKEY-BBB")
+    plugin.context.sent.clear()
+
+    out = texts_of(run(send(plugin, private_admin_event("抽奖 密钥 查看"))))
+    assert "群号必须是纯数字" not in out
+    assert "已私聊发送" in out
+    got = "\n".join(sent_texts(plugin))
+    assert "群 888888" in got
+    assert "KEY-AAA" in got and "KEY-BBB" in got
+
+
+def test_private_keys_view_without_group_id_after_draw(plugin: GroupLotteryPlugin):
+    """开奖后同样能省略群号取回剩余密钥。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 3")))
+    set_keys(plugin, "KEY-AAA\nKEY-BBB\nKEY-CCC")
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    run(send(plugin, admin_event("抽奖 开奖")))
+    plugin.context.sent.clear()
+
+    out = texts_of(run(send(plugin, private_admin_event("抽奖 密钥 查看"))))
+    assert "已私聊发送" in out
+    got = "\n".join(sent_texts(plugin))
+    assert "已结束" in got
+    assert "剩余密钥" in got
+
+
+def test_private_bare_keys_command_defaults(plugin: GroupLotteryPlugin):
+    """私聊里裸发「抽奖 密钥」应给出粘贴指引，而不是抱怨没写群号。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    out = texts_of(run(send(plugin, private_admin_event("抽奖 密钥"))))
+    assert "没有读到密钥内容" in out
+    assert "抽奖 密钥 888888" in out
+
+
+def test_private_clear_requires_explicit_group_id(plugin: GroupLotteryPlugin):
+    """「清空」是破坏性操作，省略群号时必须拒绝而不是套用默认群。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 2")))
+    set_keys(plugin, "KEY-AAA\nKEY-BBB")
+
+    out = texts_of(run(send(plugin, private_admin_event("抽奖 密钥 清空"))))
+    assert "私聊里请先写群号" in out
+    assert "你最近发布过抽奖的群：888888" in out
+    # 密钥一条都没被删
+    assert plugin.db.count_keys(1, only_free=True) == 2
+
+    # 写明群号就能清
+    out = set_keys(plugin, "清空")
+    assert "已清空" in out
+    assert plugin.db.count_keys(1, only_free=True) == 0
 
 
 def test_private_key_setup_falls_back_to_known_groups(plugin: GroupLotteryPlugin):
@@ -979,14 +1029,45 @@ def test_private_status_and_cancel_by_group_id(plugin: GroupLotteryPlugin):
 
 
 def test_private_commands_need_group_id(plugin: GroupLotteryPlugin):
+    """会改动状态的命令必须写明群号，不能靠默认群蒙混。"""
     run(send(plugin, admin_event("抽奖 发布 月卡")))
-    for text in ("抽奖 状态", "抽奖 开奖", "抽奖 取消", "抽奖 密钥"):
+    for text in ("抽奖 开奖", "抽奖 取消", "抽奖 名额", "抽奖 说明"):
         out = texts_of(run(send(plugin, private_admin_event(text))))
         assert "私聊里请先写群号" in out, text
 
     # 把时间当群号写会被明确拒绝
-    out = texts_of(run(send(plugin, private_admin_event("抽奖 定时 20:00"))))
+    out = texts_of(run(send(plugin, private_admin_event("抽奖 定时 20:00 关"))))
     assert "群号必须是纯数字" in out
+    # 抽奖仍未被开奖 / 取消
+    assert plugin.db.get_open_raffle(GROUP_UMO) is not None
+
+
+def test_private_readonly_commands_use_last_group(plugin: GroupLotteryPlugin):
+    """只读命令省略群号时，套用最近发布的那一场，并在回复里点名是哪个群。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 2")))
+
+    out = texts_of(run(send(plugin, private_admin_event("抽奖 状态"))))
+    assert "群 888888（测试群）" in out
+    assert "月卡" in out
+
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    out = texts_of(run(send(plugin, private_admin_event("抽奖 名单"))))
+    assert "群 888888" in out
+
+    # 换成另一个群发布后，默认目标跟着走
+    both = [{"group_id": 888888, "group_name": "测试群"}, {"group_id": 999999}]
+    run(send(plugin, admin_event("抽奖 取消")))
+    run(send(plugin, admin_event("抽奖 发布 点卡", group_id="999999")))
+    out = texts_of(run(send(plugin, private_admin_event("抽奖 状态", groups=both))))
+    assert "群 999999" in out
+    assert "点卡" in out
+
+
+def test_private_readonly_without_any_history(plugin: GroupLotteryPlugin):
+    """从没发布过抽奖时，省略群号仍应给出可操作的提示。"""
+    out = texts_of(run(send(plugin, private_admin_event("抽奖 状态"))))
+    assert "私聊里请先写群号" in out
+    assert "你最近发布过抽奖的群" not in out
 
 
 # ------------------------------------------------------- 每个群期数独立
