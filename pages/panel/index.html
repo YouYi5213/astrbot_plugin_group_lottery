@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>群抽奖系统 · 管理面板</title>
+<!-- AstrBot 会把该固定路径改写为带鉴权的 SDK 地址；独立打开时加载失败也不影响 -->
+<script src="/api/plugin/page/bridge-sdk.js"></script>
+<style>
+  :root {
+    --bg:#f4f6fa; --card:#fff; --card2:#fafbfd; --line:#e8ecf2; --text:#22262e;
+    --muted:#8b94a4; --brand:#7c5cff; --brand-d:#5b3fe0; --brand-l:#f1edff;
+    --ok:#22a06b; --ok-l:#e7f7f0; --warn:#e08b1f; --warn-l:#fdf3e2;
+    --danger:#e04b3d; --danger-l:#fdeceb; --shadow:0 2px 14px rgba(40,50,70,.07);
+  }
+  html[data-theme="dark"] {
+    --bg:#14161a; --card:#1d2027; --card2:#22262e; --line:#2b303a; --text:#e8ebf1;
+    --muted:#949dae; --brand:#9b83ff; --brand-d:#b3a1ff; --brand-l:#2a2540;
+    --ok:#43c78e; --ok-l:#1b3229; --warn:#e6a34a; --warn-l:#33291a;
+    --danger:#f0736a; --danger-l:#3a2321; --shadow:0 2px 14px rgba(0,0,0,.3);
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--text); font-size:14px; line-height:1.55; }
+  .topbar { background:linear-gradient(120deg,var(--brand) 0%,#a58bff 100%);
+            color:#fff; padding:20px 26px; display:flex; align-items:center; gap:14px; }
+  .topbar .logo { width:44px; height:44px; border-radius:12px; background:#ffffff33;
+                  display:flex; align-items:center; justify-content:center; font-size:24px; }
+  .topbar h1 { font-size:19px; font-weight:800; letter-spacing:.4px; }
+  .topbar p { font-size:12px; opacity:.9; margin-top:2px; }
+  .topbar .mode { margin-left:auto; font-size:11px; background:#ffffff30;
+                  padding:4px 12px; border-radius:999px; }
+  .wrap { max-width:1180px; margin:0 auto; padding:20px 18px 48px; }
+  .tabs { display:flex; gap:8px; margin-bottom:16px; flex-wrap:wrap; }
+  .tab { padding:8px 18px; border-radius:999px; background:var(--card);
+         border:1px solid var(--line); color:var(--muted); cursor:pointer;
+         font-weight:600; transition:.15s; }
+  .tab:hover { border-color:var(--brand); color:var(--brand-d); }
+  .tab.active { background:var(--brand); color:#fff; border-color:var(--brand); }
+  .view { display:none; } .view.active { display:block; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+           gap:12px; margin-bottom:16px; }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:14px;
+          padding:16px 18px; box-shadow:var(--shadow); position:relative; overflow:hidden; }
+  .stat .n { font-size:28px; font-weight:800; color:var(--brand-d); line-height:1.1; }
+  .stat .l { color:var(--muted); font-size:12.5px; margin-top:6px; }
+  .stat .ic { position:absolute; right:14px; top:14px; font-size:20px; opacity:.22; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:14px;
+           padding:16px 18px; box-shadow:var(--shadow); margin-bottom:14px; }
+  .panel h2 { font-size:15px; margin-bottom:12px; display:flex; align-items:center; gap:8px; }
+  .panel h2 .sub { font-size:12px; color:var(--muted); font-weight:400; margin-left:auto; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { padding:9px 10px; text-align:left; border-bottom:1px solid var(--line);
+          vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:12px; white-space:nowrap; }
+  tr:last-child td { border-bottom:none; }
+  .empty { color:var(--muted); text-align:center; padding:32px 0; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:11.5px;
+          font-weight:700; white-space:nowrap; }
+  .pill.open { background:var(--ok-l); color:var(--ok); }
+  .pill.drawn { background:var(--brand-l); color:var(--brand-d); }
+  .pill.cancelled { background:var(--line); color:var(--muted); }
+  .pill.key { background:var(--warn-l); color:var(--warn); }
+  .pill.contact { background:var(--brand-l); color:var(--brand-d); }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+          font-size:12.5px; word-break:break-all; }
+  .masked { filter:blur(4px); cursor:pointer; user-select:none; }
+  button { font-family:inherit; font-size:13px; cursor:pointer; border-radius:9px;
+           border:1px solid var(--line); background:var(--card2); color:var(--text);
+           padding:6px 13px; transition:.15s; }
+  button:hover { border-color:var(--brand); color:var(--brand-d); }
+  button.primary { background:var(--brand); border-color:var(--brand); color:#fff; }
+  button.primary:hover { background:var(--brand-d); color:#fff; }
+  button.danger { color:var(--danger); border-color:var(--danger-l); }
+  button.danger:hover { background:var(--danger-l); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .row-actions { display:flex; gap:6px; flex-wrap:wrap; }
+  .filters { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+  input[type=text], select, textarea {
+    font-family:inherit; font-size:13px; padding:7px 11px; border-radius:9px;
+    border:1px solid var(--line); background:var(--card2); color:var(--text); outline:none;
+  }
+  input[type=text]:focus, select:focus, textarea:focus { border-color:var(--brand); }
+  textarea { width:100%; min-height:120px; resize:vertical; line-height:1.6; }
+  .drawer-mask { position:fixed; inset:0; background:rgba(20,22,28,.45); display:none;
+                 z-index:40; }
+  .drawer-mask.show { display:block; }
+  .drawer { position:fixed; top:0; right:0; bottom:0; width:min(620px,94vw);
+            background:var(--bg); z-index:41; box-shadow:-6px 0 26px rgba(0,0,0,.2);
+            transform:translateX(102%); transition:transform .22s ease;
+            display:flex; flex-direction:column; }
+  .drawer.show { transform:none; }
+  .drawer-head { padding:16px 20px; border-bottom:1px solid var(--line);
+                 display:flex; align-items:center; gap:10px; background:var(--card); }
+  .drawer-head h3 { font-size:16px; }
+  .drawer-head button { margin-left:auto; }
+  .drawer-body { padding:16px 20px 40px; overflow:auto; flex:1; }
+  .kv { display:grid; grid-template-columns:88px 1fr; gap:6px 12px; font-size:13px; }
+  .kv .k { color:var(--muted); }
+  .toast { position:fixed; left:50%; bottom:34px; transform:translateX(-50%) translateY(10px);
+           background:#22262e; color:#fff; padding:10px 20px; border-radius:10px;
+           font-size:13px; opacity:0; pointer-events:none; transition:.22s; z-index:60; }
+  .toast.show { opacity:.96; transform:translateX(-50%); }
+  .hint { color:var(--muted); font-size:12.5px; }
+  .flex { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .grow { flex:1; min-width:120px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="logo">🎁</div>
+  <div>
+    <h1>群抽奖系统 · 管理面板</h1>
+    <p>总览 · 抽奖场次 · 中奖记录 · 密钥池（数据实时读取插件数据库）</p>
+  </div>
+  <span class="mode" id="mode">…</span>
+</div>
+
+<div class="wrap">
+  <div class="tabs">
+    <div class="tab active" data-view="overview">📊 总览</div>
+    <div class="tab" data-view="raffles">🎯 抽奖场次</div>
+    <div class="tab" data-view="winners">🏆 中奖记录</div>
+  </div>
+
+  <section class="view active" id="view-overview">
+    <div class="cards" id="stat-cards"></div>
+    <div class="panel">
+      <h2>🔥 进行中的抽奖 <span class="sub" id="open-sub"></span></h2>
+      <div id="open-list"><div class="empty">加载中…</div></div>
+    </div>
+    <div class="panel">
+      <h2>🎉 最近中奖</h2>
+      <div id="recent-list"><div class="empty">加载中…</div></div>
+    </div>
+  </section>
+
+  <section class="view" id="view-raffles">
+    <div class="panel">
+      <h2>🎯 抽奖场次</h2>
+      <div class="filters">
+        <select id="rf-status">
+          <option value="">全部状态</option>
+          <option value="open">进行中</option>
+          <option value="drawn">已开奖</option>
+          <option value="cancelled">已取消</option>
+        </select>
+        <input type="text" id="rf-group" placeholder="按群号筛选（可空）">
+        <button id="rf-reload">🔄 刷新</button>
+      </div>
+      <div id="raffle-list"><div class="empty">加载中…</div></div>
+    </div>
+  </section>
+
+  <section class="view" id="view-winners">
+    <div class="panel">
+      <h2>🏆 中奖记录</h2>
+      <div class="filters">
+        <input type="text" id="wn-group" placeholder="按群号筛选（可空）">
+        <button id="wn-reload">🔄 刷新</button>
+      </div>
+      <div id="winner-list"><div class="empty">加载中…</div></div>
+    </div>
+  </section>
+</div>
+
+<div class="drawer-mask" id="mask"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <h3 id="drawer-title">场次详情</h3>
+    <button id="drawer-close">关闭</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+<div class="toast" id="toast"></div>
+
+<script>
+/* 群抽奖系统 · 管理面板
+ * 数据层兼容两种加载方式：
+ *   1) 面板内嵌：window.AstrBotPluginPage 桥接（父页面带鉴权）；
+ *   2) 同源独立打开：回退 fetch /api/plug/{plugin}/...
+ */
+const PLUGIN = "astrbot_plugin_group_lottery";
+const ORIGIN = window.location.origin;
+const OPAQUE = !ORIGIN || ORIGIN === "null";
+const LEGACY_API = (OPAQUE ? "" : ORIGIN) + "/api/plug/" + PLUGIN;
+
+function getBridge() {
+  try {
+    const b = window.AstrBotPluginPage;
+    if (b && typeof b.apiGet === "function" && typeof b.apiPost === "function") return b;
+  } catch (e) { /* 受限沙箱 */ }
+  return null;
+}
+
+function dashboardToken() {
+  try { const t = localStorage.getItem("token"); if (t) return t; } catch (e) {}
+  try {
+    const m = document.cookie.match(/(?:^|;\s*)(?:DASHBOARD_JWT|token)=([^;]*)/i);
+    if (m && m[1]) return decodeURIComponent(m[1]);
+  } catch (e) {}
+  return "";
+}
+
+const callSub = s => String(s || "").replace(/^\/+/, "").replace(/\/+$/, "");
+function buildUrl(sub, query) {
+  const p = callSub(sub).split("/").map(encodeURIComponent).join("/");
+  const qs = query && Object.keys(query).length ? "?" + new URLSearchParams(query).toString() : "";
+  return LEGACY_API + "/" + p + qs;
+}
+
+function norm(r) {
+  if (r && typeof r === "object" && typeof r.status === "string"
+      && Object.prototype.hasOwnProperty.call(r, "data")) return r;
+  return { status: "ok", message: "", data: r };
+}
+
+async function direct(sub, query, method, body) {
+  if (OPAQUE) {
+    return { status: "error", message: "页面处于受限沙箱，请从 AstrBot 面板内打开本页", data: null };
+  }
+  let last = null;
+  for (const withToken of [true, false]) {
+    try {
+      const headers = { "Content-Type": "application/json" };
+      const t = withToken ? dashboardToken() : "";
+      if (t) headers.Authorization = "Bearer " + t;
+      const resp = await fetch(buildUrl(sub, query), {
+        method, credentials: "include", headers,
+        body: method === "GET" || body === undefined ? undefined : JSON.stringify(body),
+      });
+      const text = await resp.text();
+      let env = null;
+      try { env = text ? JSON.parse(text) : null; } catch (e) { env = null; }
+      if (resp.status === 401 || resp.status === 403) {
+        last = { status: "error", message: "登录态校验失败，请确认已登录 AstrBot 面板", data: null };
+        continue;
+      }
+      if (env) return env;
+      throw new Error("接口响应异常（HTTP " + resp.status + "）");
+    } catch (e) {
+      last = { status: "error", message: String((e && e.message) || e), data: null };
+      if (!withToken) break;
+    }
+  }
+  return last;
+}
+
+async function apiGet(sub, params) {
+  const bridge = getBridge();
+  try {
+    if (bridge) return norm(await bridge.apiGet(callSub(sub), params || {}));
+    return norm(await direct(sub, params, "GET"));
+  } catch (e) {
+    return { status: "error", message: String((e && e.message) || e), data: null };
+  }
+}
+
+async function apiPost(sub, body) {
+  const bridge = getBridge();
+  try {
+    if (bridge) return norm(await bridge.apiPost(callSub(sub), body || {}));
+    return norm(await direct(sub, null, "POST", body || {}));
+  } catch (e) {
+    return { status: "error", message: String((e && e.message) || e), data: null };
+  }
+}
+
+/* ---------------------------------------------------------------- 工具 */
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g,
+  c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const STATUS_TEXT = { open: "进行中", drawn: "已开奖", cancelled: "已取消" };
+
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.classList.remove("show"), 2600);
+}
+
+function showError(res) {
+  toast((res && res.message) || "操作失败");
+}
+
+function emptyRow(cols, text) {
+  return `<tr><td colspan="${cols}"><div class="empty">${esc(text)}</div></td></tr>`;
+}
+
+/* ---------------------------------------------------------------- 总览 */
+
+async function loadOverview() {
+  const res = await apiGet("overview");
+  if (res.status !== "ok") { showError(res); return; }
+  const { stats = {}, recent = [], open_raffles = [] } = res.data || {};
+
+  $("stat-cards").innerHTML = [
+    ["群数", stats.group_total, "👥"],
+    ["进行中", stats.raffle_open, "🎯"],
+    ["累计场次", stats.raffle_total, "📦"],
+    ["中奖人次", stats.winner_total, "🏆"],
+    ["密钥剩余", stats.key_free, "🔑"],
+  ].map(([label, value, icon]) => `
+    <div class="stat"><div class="ic">${icon}</div>
+      <div class="n">${Number(value || 0)}</div>
+      <div class="l">${label}</div></div>`).join("");
+
+  $("open-sub").textContent = open_raffles.length ? `共 ${open_raffles.length} 场` : "";
+  $("open-list").innerHTML = open_raffles.length
+    ? tableOfOpen(open_raffles)
+    : `<div class="empty">当前没有进行中的抽奖，可在群里发送「抽奖 发布 &lt;奖品名&gt;」发起</div>`;
+
+  $("recent-list").innerHTML = recent.length
+    ? `<table><thead><tr><th>时间</th><th>群号</th><th>奖品</th><th>中奖者</th><th>密钥</th><th>私聊</th></tr></thead>
+       <tbody>${recent.map(w => `<tr>
+          <td class="hint">${esc(w.time_str)}</td>
+          <td class="mono">${esc(w.group_id)}</td>
+          <td>${esc(w.title)}</td>
+          <td>${esc(w.name || w.user_id)}</td>
+          <td class="mono">${w.prize ? esc(w.prize) : "<span class='hint'>—</span>"}</td>
+          <td>${w.notified ? '<span class="pill open">已送达</span>'
+                           : (w.prize ? '<span class="pill cancelled">待补领</span>' : "<span class='hint'>—</span>")}</td>
+        </tr>`).join("")}</tbody></table>`
+    : `<div class="empty">还没有中奖记录</div>`;
+
+  bindRowActions($("open-list"));
+}
+
+function tableOfOpen(rows) {
+  return `<table><thead><tr>
+      <th>期次</th><th>群号</th><th>奖品</th><th>名额</th><th>报名</th>
+      <th>形式</th><th>自动开奖</th><th>操作</th></tr></thead>
+    <tbody>${rows.map(r => `<tr>
+      <td class="mono">#${r.id}</td>
+      <td class="mono">${esc(r.group_id)}</td>
+      <td>${esc(r.title)}</td>
+      <td>${Number(r.winner_count || 1)}</td>
+      <td>${Number(r.participant_count || 0)}</td>
+      <td>${r.prize_kind === "key"
+            ? `<span class="pill key">密钥 ${Number(r.free_keys || 0)}</span>`
+            : `<span class="pill contact">联系群主</span>`}</td>
+      <td class="hint">${esc(r.draw_at_str || "手动")}</td>
+      <td><div class="row-actions">
+        <button data-detail="${r.id}">详情</button>
+        <button class="primary" data-draw="${r.id}">开奖</button>
+        <button class="danger" data-cancel="${r.id}">取消</button>
+      </div></td></tr>`).join("")}</tbody></table>`;
+}
+
+/* ---------------------------------------------------------------- 场次 */
+
+async function loadRaffles() {
+  const params = { limit: 200 };
+  const status = $("rf-status").value;
+  const group = $("rf-group").value.trim();
+  if (status) params.status = status;
+  if (group) params.group_id = group;
+
+  const res = await apiGet("raffles", params);
+  if (res.status !== "ok") { showError(res); return; }
+  const rows = (res.data && res.data.raffles) || [];
+  $("raffle-list").innerHTML = rows.length
+    ? `<table><thead><tr>
+        <th>期次</th><th>群号</th><th>奖品</th><th>状态</th><th>名额</th>
+        <th>报名</th><th>密钥</th><th>创建</th><th>开奖</th><th>操作</th></tr></thead>
+      <tbody>${rows.map(r => `<tr>
+        <td class="mono">#${r.id}</td>
+        <td class="mono">${esc(r.group_id)}</td>
+        <td>${esc(r.title)}</td>
+        <td><span class="pill ${esc(r.status)}">${esc(r.status_label)}</span></td>
+        <td>${Number(r.winner_count || 1)}</td>
+        <td>${Number(r.participant_count || 0)}</td>
+        <td>${r.prize_kind === "key"
+              ? `<span class="pill key">余 ${Number(r.free_keys || 0)}</span>`
+              : `<span class="hint">—</span>`}</td>
+        <td class="hint">${esc(r.created_at_str)}</td>
+        <td class="hint">${esc(r.drawn_at_str || "—")}</td>
+        <td><div class="row-actions">
+          <button data-detail="${r.id}">详情</button>
+          ${r.status === "open"
+            ? `<button class="primary" data-draw="${r.id}">开奖</button>
+               <button class="danger" data-cancel="${r.id}">取消</button>` : ""}
+        </div></td></tr>`).join("")}</tbody></table>`
+    : `<div class="empty">没有符合条件的场次</div>`;
+  bindRowActions($("raffle-list"));
+}
+
+function bindRowActions(scope) {
+  scope.querySelectorAll("[data-detail]").forEach(b => {
+    b.onclick = () => openDetail(b.dataset.detail);
+  });
+  scope.querySelectorAll("[data-draw]").forEach(b => {
+    b.onclick = async () => {
+      if (!confirm(`确认立即为第 ${b.dataset.draw} 期开奖？开奖后无法撤销。`)) return;
+      b.disabled = true;
+      const res = await apiPost("raffle/draw", { raffle_id: Number(b.dataset.draw) });
+      if (res.status === "ok") { toast("已开奖，请在群里查看结果"); refreshAll(); }
+      else { showError(res); b.disabled = false; }
+    };
+  });
+  scope.querySelectorAll("[data-cancel]").forEach(b => {
+    b.onclick = async () => {
+      if (!confirm(`确认取消第 ${b.dataset.cancel} 期抽奖？`)) return;
+      const res = await apiPost("raffle/cancel", { raffle_id: Number(b.dataset.cancel) });
+      if (res.status === "ok") { toast("已取消"); refreshAll(); } else showError(res);
+    };
+  });
+}
+
+/* ---------------------------------------------------------------- 详情 */
+
+async function openDetail(id) {
+  $("drawer").classList.add("show");
+  $("mask").classList.add("show");
+  $("drawer-title").textContent = `第 ${id} 期详情`;
+  $("drawer-body").innerHTML = `<div class="empty">加载中…</div>`;
+
+  const res = await apiGet("raffle/" + id);
+  if (res.status !== "ok") {
+    $("drawer-body").innerHTML = `<div class="empty">${esc(res.message || "加载失败")}</div>`;
+    return;
+  }
+  const { raffle = {}, participants = [], winners = [], keys = [] } = res.data || {};
+  const free = keys.filter(k => !k.assigned_to);
+  const assigned = keys.filter(k => k.assigned_to);
+
+  const keyRows = keys.length
+    ? `<table><thead><tr><th>#</th><th>密钥</th><th>归属</th><th>发放时间</th></tr></thead>
+       <tbody>${keys.map((k, i) => `<tr>
+          <td class="hint">${i + 1}</td>
+          <td class="mono masked" data-reveal>${esc(k.content)}</td>
+          <td class="mono">${k.assigned_to ? esc(k.assigned_to) : '<span class="pill open">未发放</span>'}</td>
+          <td class="hint">${esc(k.assigned_at_str || "—")}</td></tr>`).join("")}</tbody></table>
+       <p class="hint" style="margin-top:8px">点击密钥可显示 / 隐藏明文。剩余 ${free.length} 条，已发放 ${assigned.length} 条。</p>`
+    : `<div class="empty">本场没有设置密钥</div>`;
+
+  $("drawer-body").innerHTML = `
+    <div class="panel">
+      <h2>基本信息</h2>
+      <div class="kv">
+        <div class="k">奖品</div><div>${esc(raffle.title)}</div>
+        <div class="k">状态</div><div><span class="pill ${esc(raffle.status)}">${esc(raffle.status_label)}</span></div>
+        <div class="k">群号</div><div class="mono">${esc(raffle.group_id)}</div>
+        <div class="k">名额</div><div>${Number(raffle.winner_count || 1)}</div>
+        <div class="k">形式</div><div>${raffle.prize_kind === "key" ? "私聊发密钥" : "联系群主领取"}</div>
+        <div class="k">说明</div><div>${esc(raffle.description || "—")}</div>
+        <div class="k">自动开奖</div><div>${esc(raffle.draw_at_str || "未设置（手动开奖）")}</div>
+        <div class="k">满员开奖</div><div>${raffle.min_players ? Number(raffle.min_players) + " 人" : "未设置"}</div>
+        <div class="k">触发方式</div><div>${esc(raffle.trigger_label || "—")}</div>
+        <div class="k">创建 / 开奖</div><div class="hint">${esc(raffle.created_at_str)} / ${esc(raffle.drawn_at_str || "—")}</div>
+      </div>
+      ${raffle.status === "open" ? `<div class="row-actions" style="margin-top:14px">
+        <button class="primary" data-draw="${raffle.id}">立即开奖</button>
+        <button class="danger" data-cancel="${raffle.id}">取消抽奖</button>
+      </div>` : ""}
+    </div>
+
+    ${raffle.status === "open" ? `<div class="panel">
+      <h2>密钥池 <span class="sub">支持一次粘贴多行，逗号 / 分号 / 换行分隔</span></h2>
+      <textarea id="key-input" placeholder="每行一条密钥，例如：&#10;ABCD-1111-2222&#10;EFGH-3333-4444"></textarea>
+      <div class="flex" style="margin-top:10px">
+        <select id="key-mode">
+          <option value="append">追加到现有密钥池</option>
+          <option value="replace">覆盖现有未发放密钥</option>
+        </select>
+        <button class="primary" id="key-save">保存密钥</button>
+        <span class="hint">保存后本场自动切换为「私聊发密钥」模式</span>
+      </div>
+    </div>` : ""}
+
+    <div class="panel">
+      <h2>中奖名单 <span class="sub">${winners.length} 人</span></h2>
+      ${winners.length ? `<table><thead><tr><th>#</th><th>昵称</th><th>用户 ID</th><th>密钥</th><th>私聊</th></tr></thead>
+        <tbody>${winners.map(w => `<tr>
+          <td class="hint">${Number(w.rank || 0)}</td>
+          <td>${esc(w.name || "")}</td>
+          <td class="mono">${esc(w.user_id)}</td>
+          <td class="mono">${w.prize ? esc(w.prize) : "<span class='hint'>—</span>"}</td>
+          <td>${w.prize ? (w.notified ? '<span class="pill open">已送达</span>' : '<span class="pill cancelled">待补领</span>')
+                       : "<span class='hint'>—</span>"}</td>
+        </tr>`).join("")}</tbody></table>` : `<div class="empty">尚未开奖</div>`}
+    </div>
+
+    <div class="panel">
+      <h2>密钥明细 <span class="sub">共 ${keys.length} 条</span></h2>
+      ${keyRows}
+    </div>
+
+    <div class="panel">
+      <h2>报名名单 <span class="sub">${participants.length} 人</span></h2>
+      ${participants.length ? `<table><thead><tr><th>#</th><th>昵称</th><th>用户 ID</th></tr></thead>
+        <tbody>${participants.map((p, i) => `<tr>
+          <td class="hint">${i + 1}</td><td>${esc(p.name || "")}</td>
+          <td class="mono">${esc(p.user_id)}</td></tr>`).join("")}</tbody></table>`
+        : `<div class="empty">还没有人报名</div>`}
+    </div>`;
+
+  bindRowActions($("drawer-body"));
+  $("drawer-body").querySelectorAll("[data-reveal]").forEach(el => {
+    el.onclick = () => el.classList.toggle("masked");
+  });
+  const saveBtn = $("key-save");
+  if (saveBtn) {
+    saveBtn.onclick = async () => {
+      const text = $("key-input").value;
+      if (!text.trim()) { toast("请先粘贴密钥内容"); return; }
+      saveBtn.disabled = true;
+      const r = await apiPost("raffle/keys", {
+        raffle_id: Number(raffle.id), keys: text, mode: $("key-mode").value,
+      });
+      saveBtn.disabled = false;
+      if (r.status === "ok") { toast(r.message || "已保存"); openDetail(raffle.id); refreshAll(); }
+      else showError(r);
+    };
+  }
+}
+
+function closeDrawer() {
+  $("drawer").classList.remove("show");
+  $("mask").classList.remove("show");
+}
+
+/* ---------------------------------------------------------------- 中奖 */
+
+async function loadWinners() {
+  const params = { limit: 500 };
+  const group = $("wn-group").value.trim();
+  if (group) params.group_id = group;
+  const res = await apiGet("winners", params);
+  if (res.status !== "ok") { showError(res); return; }
+  const rows = (res.data && res.data.winners) || [];
+  $("winner-list").innerHTML = rows.length
+    ? `<table><thead><tr>
+        <th>时间</th><th>期次</th><th>群号</th><th>奖品</th>
+        <th>中奖者</th><th>用户 ID</th><th>密钥</th><th>状态</th></tr></thead>
+      <tbody>${rows.map(w => `<tr>
+        <td class="hint">${esc(w.time_str)}</td>
+        <td class="mono">#${w.raffle_id}</td>
+        <td class="mono">${esc(w.group_id)}</td>
+        <td>${esc(w.title)}</td>
+        <td>${esc(w.name || "")}</td>
+        <td class="mono">${esc(w.user_id)}</td>
+        <td class="mono">${w.prize ? esc(w.prize) : "<span class='hint'>—</span>"}</td>
+        <td>${w.prize ? (w.notified ? '<span class="pill open">已送达</span>' : '<span class="pill cancelled">待补领</span>')
+                     : '<span class="pill drawn">联系群主</span>'}</td>
+      </tr>`).join("")}</tbody></table>`
+    : `<div class="empty">暂无中奖记录</div>`;
+}
+
+/* ---------------------------------------------------------------- 入口 */
+
+function refreshAll() {
+  loadOverview();
+  if ($("view-raffles").classList.contains("active")) loadRaffles();
+  if ($("view-winners").classList.contains("active")) loadWinners();
+}
+
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.onclick = () => {
+    document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
+    document.querySelectorAll(".view").forEach(x => x.classList.remove("active"));
+    tab.classList.add("active");
+    $("view-" + tab.dataset.view).classList.add("active");
+    if (tab.dataset.view === "overview") loadOverview();
+    if (tab.dataset.view === "raffles") loadRaffles();
+    if (tab.dataset.view === "winners") loadWinners();
+  };
+});
+
+$("rf-reload").onclick = loadRaffles;
+$("wn-reload").onclick = loadWinners;
+$("rf-status").onchange = loadRaffles;
+$("rf-group").onkeydown = e => { if (e.key === "Enter") loadRaffles(); };
+$("wn-group").onkeydown = e => { if (e.key === "Enter") loadWinners(); };
+$("drawer-close").onclick = closeDrawer;
+$("mask").onclick = closeDrawer;
+
+(async function init() {
+  const bridge = getBridge();
+  if (bridge && typeof bridge.ready === "function") {
+    try { await Promise.race([bridge.ready(), new Promise(r => setTimeout(r, 3000))]); } catch (e) {}
+  }
+  $("mode").textContent = bridge ? "面板内嵌" : "独立页面";
+  try {
+    const theme = localStorage.getItem("theme");
+    if (theme === "dark") document.documentElement.dataset.theme = "dark";
+  } catch (e) {}
+  await loadOverview();
+})();
+</script>
+</body>
+</html>

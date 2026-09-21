@@ -1,0 +1,71 @@
+{
+  "contact": {
+    "description": "群主 / 管理员联系方式",
+    "type": "string",
+    "default": "群主",
+    "hint": "开奖公告里提示中奖者联系谁领取奖品，例如「群主 @张三」或「管理员私聊 QQ 123456」。",
+    "obvious_hint": true
+  },
+  "admins": {
+    "description": "额外管理员 QQ 号",
+    "type": "list",
+    "default": [],
+    "hint": "除 AstrBot 全局管理员、群主、群管理员外，允许在这里补充可以用「抽奖 发布 / 开奖」等管理指令的 QQ 号。"
+  },
+  "group_mode": {
+    "description": "群启用模式",
+    "type": "string",
+    "default": "blacklist",
+    "options": [
+      "blacklist",
+      "whitelist"
+    ],
+    "hint": "blacklist：除黑名单外的群都可用；whitelist：只有白名单里的群可用。"
+  },
+  "group_whitelist": {
+    "description": "群白名单",
+    "type": "list",
+    "default": []
+  },
+  "group_blacklist": {
+    "description": "群黑名单",
+    "type": "list",
+    "default": []
+  },
+  "allow_no_prefix": {
+    "description": "允许不带唤醒前缀使用",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后群里直接发「抽奖 状态」即可触发（不必写 /抽奖）。关闭后必须用 /抽奖 或 @机器人 抽奖。"
+  },
+  "at_winners": {
+    "description": "开奖公告 @ 中奖者",
+    "type": "bool",
+    "default": true,
+    "hint": "部分平台（如 QQ 官方机器人）不支持真实 @，会自动降级为文本昵称。"
+  },
+  "announce_template": {
+    "description": "群内开奖公告模板",
+    "type": "text",
+    "default": "🎉 恭喜 <winners> 中奖！\n奖品：<prize>（共 <count> 名）\n请尽快联系 <contact> 领取奖励。",
+    "hint": "可用占位符：<winners> 中奖名单、<count> 中奖人数、<prize> 奖品名、<group> 群号、<time> 开奖时间、<contact> 联系方式、<raffle_id> 场次编号。"
+  },
+  "private_template": {
+    "description": "私聊发奖模板",
+    "type": "text",
+    "default": "🎉 恭喜你在「<prize>」抽奖中中奖！\n\n你的专属密钥：\n<key>\n\n请妥善保管，切勿外传。\n（群号 <group> · 开奖时间 <time>）",
+    "hint": "可用占位符：<key> 密钥、<prize> 奖品名、<name> 昵称、<group> 群号、<time> 开奖时间、<contact> 联系方式、<raffle_id> 场次编号。"
+  },
+  "check_interval_seconds": {
+    "description": "自动开奖检查间隔（秒）",
+    "type": "int",
+    "default": 20,
+    "hint": "后台定时任务每隔多少秒检查一次到点的抽奖，建议 10-60。"
+  },
+  "history_limit": {
+    "description": "每群保留的开奖记录条数",
+    "type": "int",
+    "default": 200,
+    "hint": "超出后自动清理最旧的记录，避免数据库无限膨胀。"
+  }
+}
