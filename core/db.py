@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS raffles (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     umo            TEXT    NOT NULL,
     group_id       TEXT    NOT NULL DEFAULT '',
+    seq            INTEGER NOT NULL DEFAULT 0,
     title          TEXT    NOT NULL,
     description    TEXT    NOT NULL DEFAULT '',
     prize_kind     TEXT    NOT NULL DEFAULT 'contact',
@@ -116,7 +117,44 @@ class LotteryDB:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
             self._migrate_session_isolation()
+            self._migrate_add_seq()
             self._conn.commit()
+
+    def _columns(self, table: str) -> set[str]:
+        """读取表的列名集合。"""
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {str(row["name"]) for row in rows}
+
+    def _migrate_add_seq(self) -> None:
+        """补上群内期号 ``seq`` 列，并为历史数据回填。
+
+        ``CREATE TABLE IF NOT EXISTS`` 不会给老库加列，所以这里显式补。回填按
+        ``(group_id, id)`` 顺序编号，保证老记录也有正确的群内期号。
+        """
+        try:
+            if "seq" not in self._columns("raffles"):
+                self._conn.execute(
+                    "ALTER TABLE raffles ADD COLUMN seq INTEGER NOT NULL DEFAULT 0",
+                )
+            pending = self._conn.execute(
+                "SELECT id, group_id FROM raffles WHERE seq IS NULL OR seq = 0 ORDER BY group_id, id",
+            ).fetchall()
+            if not pending:
+                return
+            counters: dict[str, int] = {}
+            for row in self._conn.execute(
+                "SELECT group_id, COALESCE(MAX(seq), 0) AS top FROM raffles GROUP BY group_id",
+            ).fetchall():
+                counters[str(row["group_id"])] = int(row["top"] or 0)
+            for row in pending:
+                group_id = str(row["group_id"])
+                counters[group_id] = counters.get(group_id, 0) + 1
+                self._conn.execute(
+                    "UPDATE raffles SET seq = ? WHERE id = ?",
+                    (counters[group_id], row["id"]),
+                )
+        except Exception as exc:  # pragma: no cover - 迁移失败不应阻断启动
+            logger.warning(f"[群抽奖] 群内期号迁移失败（可忽略）：{exc}")
 
     def _migrate_session_isolation(self) -> None:
         """把受 ``unique_session`` 污染的群标识修正回真实群号。
@@ -185,17 +223,28 @@ class LotteryDB:
         min_players: int | None = None,
         created_by: str = "",
     ) -> int:
-        """新建一场抽奖，返回场次 ID。"""
+        """新建一场抽奖，返回场次 ID。
+
+        ``id`` 是跨群全局自增的内部主键（用于关联参与者 / 密钥 / 中奖记录）；
+        对用户展示的期号用 ``seq``，它按群独立从 1 开始。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM raffles WHERE group_id = ?",
+                (group_id,),
+            ).fetchone()
+            seq = int(row["next"] if row else 1)
         cur = self._exec(
             """
             INSERT INTO raffles
-                (umo, group_id, title, description, prize_kind, winner_count,
+                (umo, group_id, seq, title, description, prize_kind, winner_count,
                  draw_at, min_players, private_notify, status, created_at, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             """,
             (
                 umo,
                 group_id,
+                seq,
                 title,
                 description,
                 KIND_CONTACT,
@@ -444,19 +493,25 @@ class LotteryDB:
         raffle_id: int | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """查询中奖记录。"""
-        sql = "SELECT * FROM winners WHERE 1 = 1"
+        """查询中奖记录。
+
+        额外带出该场在群内的期号 ``raffle_seq``，供文案展示使用。
+        """
+        sql = (
+            "SELECT w.*, COALESCE(r.seq, 0) AS raffle_seq FROM winners w "
+            "LEFT JOIN raffles r ON r.id = w.raffle_id WHERE 1 = 1"
+        )
         params: list[Any] = []
         if umo:
-            sql += " AND umo = ?"
+            sql += " AND w.umo = ?"
             params.append(umo)
         if user_id:
-            sql += " AND user_id = ?"
+            sql += " AND w.user_id = ?"
             params.append(str(user_id))
         if raffle_id is not None:
-            sql += " AND raffle_id = ?"
+            sql += " AND w.raffle_id = ?"
             params.append(int(raffle_id))
-        sql += " ORDER BY id DESC LIMIT ?"
+        sql += " ORDER BY w.id DESC LIMIT ?"
         params.append(max(1, int(limit)))
         return self._query(sql, tuple(params))
 

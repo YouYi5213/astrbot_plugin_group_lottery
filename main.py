@@ -26,6 +26,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
 from .core import texts
+from .core.args import PublishParseError, parse_publish
 from .core.db import LotteryDB
 from .core.engine import available_seats, draw, parse_keys
 from .core.models import (
@@ -590,7 +591,7 @@ class GroupLotteryPlugin(Star):
             for row in rows:
                 key = f" · {row['prize']}" if row.get("prize") else ""
                 lines.append(
-                    f"· 第 {row['raffle_id']} 期「{row.get('title', '')}」"
+                    f"· {texts.raffle_label(row)}「{row.get('title', '')}」"
                     f"（群 {row.get('group_id', '')}）{key}",
                 )
             yield event.plain_result("\n".join(lines))
@@ -663,7 +664,7 @@ class GroupLotteryPlugin(Star):
             # 没有待领取的：只回报中奖概览，避免在群里重复泄露密钥
             lines = ["📜 你的中奖记录（均已领取）："]
             for row in rows:
-                lines.append(f"· 第 {row['raffle_id']} 期「{row.get('title', '')}」")
+                lines.append(f"· {texts.raffle_label(row)}「{row.get('title', '')}」")
             lines.append("如需重新获取密钥，请私聊机器人发送「抽奖 领取」。")
             yield event.plain_result("\n".join(lines))
             return
@@ -706,8 +707,13 @@ class GroupLotteryPlugin(Star):
     ) -> AsyncGenerator[Any, None]:
         """发布一场新抽奖。
 
-        群里：``抽奖 发布 <奖品名> [名额]``
-        私聊：``抽奖 发布 <群号> <奖品名> [名额]``，并在该群播报一条开奖信息。
+        群里：``抽奖 发布 <奖品名> [名额] [选项…]``
+        私聊：``抽奖 发布 <群号> <奖品名> [名额] [选项…]``，并在该群播报一条信息。
+
+        可选选项：``定时 <时间>`` / ``满员 <人数>`` / ``名额 <数字>`` /
+        ``私聊 开|关`` / ``说明 <文本>``，可一次写完，例如::
+
+            抽奖 发布 754797467 支付宝口令红包5元 2 定时 20:00 满员 8
         """
         umo, group_id, group_name, body = await self._target(event, tail)
         from_private = event.is_private_chat()
@@ -716,38 +722,51 @@ class GroupLotteryPlugin(Star):
         if existing:
             yield event.plain_result(
                 f"群 {group_id} 已有一场进行中的抽奖："
-                f"「{existing.get('title', '')}」（第 {existing['id']} 期）。\n"
+                f"「{existing.get('title', '')}」（{texts.raffle_label(existing)}）。\n"
                 f"请先「抽奖 开奖」或「抽奖 取消」。",
             )
             return
 
         if not body:
             raise ValueError(
-                "用法：抽奖 发布 <奖品名> [名额]，例如「抽奖 发布 月卡 3」"
+                "用法：抽奖 发布 <奖品名> [名额] [选项…]\n"
+                "例如：抽奖 发布 月卡 3 定时 20:00 满员 8\n"
+                "选项：名额 <数字> / 定时 <时间> / 满员 <人数> / 私聊 开|关 / 说明 <文本>"
                 + (
-                    "\n私聊里请写成：抽奖 发布 <群号> <奖品名> [名额]"
+                    "\n私聊里请在奖品名前面加上群号：抽奖 发布 <群号> <奖品名> [名额]"
                     if from_private
                     else ""
                 ),
             )
 
-        winner_count = 1
-        parts = body.split()
-        if len(parts) >= 2 and parts[-1].isdigit():
-            winner_count = int(parts[-1])
-            body = " ".join(parts[:-1]).strip()
-        if not body:
-            raise ValueError("请填写奖品名称")
-        if not 1 <= winner_count <= MAX_WINNERS:
-            raise ValueError(f"中奖名额需在 1 - {MAX_WINNERS} 之间")
+        try:
+            spec = parse_publish(body)
+        except PublishParseError as exc:
+            raise ValueError(str(exc)) from exc
 
+        # 定时选项先解析时间，避免建了场次才发现时间写错
+        draw_at: int | None = None
+        draw_at_label = ""
+        if spec.draw_at_text:
+            draw_at, draw_at_label = parse_draw_time(spec.draw_at_text)
+
+        winner_count = spec.winner_count or 1
         raffle_id = self.db.create_raffle(
             umo=umo,
             group_id=group_id,
-            title=body,
+            title=spec.title,
+            description=spec.description,
             winner_count=winner_count,
+            draw_at=draw_at,
+            min_players=spec.min_players,
             created_by=str(event.get_sender_id()),
         )
+        if spec.private_notify is not None:
+            self.db.update_raffle(
+                raffle_id,
+                private_notify=1 if spec.private_notify else 0,
+                prize_kind=KIND_KEY if spec.private_notify else KIND_CONTACT,
+            )
         raffle = self.db.get_raffle(raffle_id) or {}
 
         # 私聊发布时群里看不到任何痕迹，需要单独播报一条
@@ -762,10 +781,16 @@ class GroupLotteryPlugin(Star):
 
         where = f"群 {group_id}" + (f"（{group_name}）" if group_name else "")
         lines = [
-            f"🎁 抽奖已发布！（第 {raffle_id} 期 · {where}）",
-            f"奖品：{body}",
+            f"🎁 抽奖已发布！（{texts.raffle_label(raffle)} · {where}）",
+            f"奖品：{spec.title}",
             f"名额：{winner_count} 名",
         ]
+        if draw_at_label:
+            lines.append(f"开奖时间：{draw_at_label}")
+        if spec.min_players:
+            lines.append(f"满员提前开奖：报名满 {spec.min_players} 人")
+        if spec.description:
+            lines.append(f"说明：{spec.description}")
         if from_private:
             lines.append(
                 "✅ 已在该群播报抽奖信息。"
@@ -779,18 +804,23 @@ class GroupLotteryPlugin(Star):
             if from_private
             else "· 私聊机器人发送「抽奖 密钥 <群号>」再粘贴密钥 —— 设置密钥池（密钥不能发在群里）"
         )
-        for usage, desc in (
-            (
-                f"抽奖 定时 {group_id} 20:00" if from_private else "抽奖 定时 20:00",
-                "到点自动开奖",
-            ),
-            (
-                f"抽奖 满员 {group_id} 10" if from_private else "抽奖 满员 10",
-                "报名满 10 人提前开奖",
-            ),
-            (f"抽奖 开奖 {group_id}" if from_private else "抽奖 开奖", "立即开奖"),
-        ):
-            lines.append(f"· {usage} —— {desc}")
+        if not draw_at_label:
+            lines.append(
+                f"· 抽奖 定时 {group_id} 20:00 —— 到点自动开奖"
+                if from_private
+                else "· 抽奖 定时 20:00 —— 到点自动开奖"
+            )
+        if not spec.min_players:
+            lines.append(
+                f"· 抽奖 满员 {group_id} 10 —— 报名满 10 人提前开奖"
+                if from_private
+                else "· 抽奖 满员 10 —— 报名满 10 人提前开奖"
+            )
+        lines.append(
+            f"· 抽奖 开奖 {group_id} —— 立即开奖"
+            if from_private
+            else "· 抽奖 开奖 —— 立即开奖"
+        )
         yield event.plain_result("\n".join(lines))
 
     async def _h_keys(
@@ -832,9 +862,7 @@ class GroupLotteryPlugin(Star):
 
         if body in ("查看", "list", "ls"):
             raffle = self._require_open_raffle(umo)
-            async for result in self._send_remaining_keys(
-                event, int(raffle["id"]), group_id
-            ):
+            async for result in self._send_remaining_keys(event, raffle, group_id):
                 yield result
             return
 
@@ -844,7 +872,7 @@ class GroupLotteryPlugin(Star):
             removed = self.db.clear_keys(raffle_id)
             self.db.update_raffle(raffle_id, prize_kind=KIND_CONTACT, private_notify=0)
             yield event.plain_result(
-                f"🧹 已清空群 {group_id} 第 {raffle_id} 期 {removed} 条未发放密钥，"
+                f"🧹 已清空群 {group_id} {texts.raffle_label(raffle)} {removed} 条未发放密钥，"
                 "该场已切回「联系群主领取」模式。"
             )
             return
@@ -879,7 +907,7 @@ class GroupLotteryPlugin(Star):
         where = f"群 {group_id}" + (f"（{group_name}）" if group_name else "")
         verb = "追加" if append else "设置"
         lines = [
-            f"🔑 {where} 第 {raffle_id} 期已{verb} {inserted} 条密钥，当前剩余 {total} 条。",
+            f"🔑 {where} {texts.raffle_label(raffle)}已{verb} {inserted} 条密钥，当前剩余 {total} 条。",
             "该场已切换为「私聊发密钥」模式，开奖后机器人会私聊把密钥发给中奖者。",
         ]
         if total < need:
@@ -889,15 +917,20 @@ class GroupLotteryPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     async def _send_remaining_keys(
-        self, event: AstrMessageEvent, raffle_id: int, group_id: str = ""
+        self,
+        event: AstrMessageEvent,
+        raffle: dict[str, Any],
+        group_id: str = "",
     ) -> AsyncGenerator[Any, None]:
         """把剩余密钥私聊发给操作者（群里只回报结果，不显示明文）。"""
+        raffle_id = int(raffle["id"])
+        label = texts.raffle_label(raffle)
         rows = self.db.list_keys(raffle_id)
         free = [r for r in rows if not r.get("assigned_to")]
         if not free:
-            yield event.plain_result(f"第 {raffle_id} 期密钥池为空。")
+            yield event.plain_result(f"{label}密钥池为空。")
             return
-        scope = f"群 {group_id} 第 {raffle_id} 期" if group_id else f"第 {raffle_id} 期"
+        scope = (f"群 {group_id} " if group_id else "") + label
         lines = [f"🔑 {scope}剩余密钥（{len(free)}/{len(rows)}）："]
         lines.extend(f"{i}. {r['content']}" for i, r in enumerate(free, 1))
         sent = await send_private_text(
@@ -1051,7 +1084,9 @@ class GroupLotteryPlugin(Star):
             closed_note="管理员取消",
             drawn_at=int(time.time()),
         )
-        yield event.plain_result(f"🚫 群 {group_id} 第 {raffle['id']} 期抽奖已取消。")
+        yield event.plain_result(
+            f"🚫 群 {group_id} {texts.raffle_label(raffle)}抽奖已取消。"
+        )
 
     async def _h_draw_now(
         self, event: AstrMessageEvent, tail: str
@@ -1100,7 +1135,7 @@ class GroupLotteryPlugin(Star):
                 drawn_at=int(time.time()),
                 draw_trigger=trigger,
             )
-            message = f"😶 第 {raffle_id} 期「{raffle.get('title', '')}」无人报名，已自动取消。"
+            message = f"😶 {texts.raffle_label(raffle)}「{raffle.get('title', '')}」无人报名，已自动取消。"
             if trigger != TRIGGER_MANUAL:
                 await send_group_text(self.context, umo, message, allow_at=False)
                 return None
@@ -1219,7 +1254,7 @@ class GroupLotteryPlugin(Star):
             logger.warning(f"[群抽奖] 历史记录清理失败：{exc}")
 
         logger.info(
-            f"[群抽奖] 第 {raffle_id} 期「{raffle.get('title', '')}」开奖完成："
+            f"[群抽奖] {texts.raffle_label(raffle)}「{raffle.get('title', '')}」开奖完成："
             f"{outcome.winner_count} 名中奖者，触发方式 {trigger}，私聊失败 {len(failed_dm)} 人",
         )
         return None
@@ -1289,7 +1324,7 @@ class GroupLotteryPlugin(Star):
                 await send_group_text(
                     self.context,
                     umo,
-                    f"⚠️ 第 {raffle_id} 期「{raffle.get('title', '')}」定时开奖失败：{error}\n"
+                    f"⚠️ {texts.raffle_label(raffle)}「{raffle.get('title', '')}」定时开奖失败：{error}\n"
                     "已自动取消定时，请管理员处理后手动发送「抽奖 开奖」。",
                     allow_at=False,
                 )

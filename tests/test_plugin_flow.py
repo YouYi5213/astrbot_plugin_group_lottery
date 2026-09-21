@@ -233,10 +233,70 @@ def private_admin_event(text: str, *, groups=None, **kwargs) -> FakeEvent:
 # --------------------------------------------------------------- 发布 / 报名
 
 
+def test_publish_one_liner_with_options(plugin: GroupLotteryPlugin):
+    """一行式发布：奖品名 + 名额 + 定时 + 满员 一次写完。"""
+    out = texts_of(
+        run(
+            send(plugin, admin_event("抽奖 发布 支付宝口令红包5元 2 定时 20:00 满员 8"))
+        ),
+    )
+    assert "抽奖已发布" in out
+    assert "奖品：支付宝口令红包5元" in out
+    assert "名额：2 名" in out
+    assert "开奖时间：" in out
+    assert "满员提前开奖：报名满 8 人" in out
+
+    raffle = plugin.db.get_open_raffle(GROUP_UMO)
+    assert raffle["title"] == "支付宝口令红包5元"
+    assert raffle["winner_count"] == 2
+    assert raffle["draw_at"] is not None
+    assert raffle["min_players"] == 8
+
+
+def test_publish_one_liner_from_private(plugin: GroupLotteryPlugin):
+    """私聊一行式：群号 + 奖品 + 名额 + 定时 + 满员 + 说明。"""
+    out = texts_of(
+        run(
+            send(
+                plugin,
+                private_admin_event(
+                    f"抽奖 发布 {GROUP_ID} 月卡 3 定时 +2h 满员 10 说明 手慢无",
+                ),
+            )
+        )
+    )
+    assert "抽奖已发布" in out
+    assert "说明：手慢无" in out
+
+    raffle = plugin.db.get_open_raffle(GROUP_UMO)
+    assert raffle["title"] == "月卡"
+    assert raffle["winner_count"] == 3
+    assert raffle["min_players"] == 10
+    assert raffle["description"] == "手慢无"
+    # 群里要收到播报，且播报里带上说明与满员条件
+    notice = sent_texts(plugin, GROUP_UMO)[-1]
+    assert "手慢无" in notice
+    assert "报名满 10 人" in notice
+
+
+def test_publish_one_liner_reports_bad_option(plugin: GroupLotteryPlugin):
+    out = texts_of(run(send(plugin, admin_event("抽奖 发布 月卡 满员 1"))))
+    assert "满员人数至少为 2" in out
+    # 参数错误时不该建出场次
+    assert plugin.db.get_open_raffle(GROUP_UMO) is None
+
+
+def test_publish_one_liner_does_not_create_on_bad_time(plugin: GroupLotteryPlugin):
+    out = texts_of(run(send(plugin, admin_event("抽奖 发布 月卡 定时 不是时间"))))
+    assert "参数错误" in out or "时间" in out
+    assert plugin.db.get_open_raffle(GROUP_UMO) is None
+
+
 def test_publish_and_join_flow(plugin: GroupLotteryPlugin):
     out = texts_of(run(send(plugin, admin_event("抽奖 发布 月卡 2"))))
     assert "抽奖已发布" in out
     assert "名额：2 名" in out
+    assert "第 1 期" in out
 
     raffle = plugin.db.get_open_raffle(GROUP_UMO)
     assert raffle and raffle["title"] == "月卡" and raffle["winner_count"] == 2
@@ -800,6 +860,59 @@ def test_private_commands_need_group_id(plugin: GroupLotteryPlugin):
     # 把时间当群号写会被明确拒绝
     out = texts_of(run(send(plugin, private_admin_event("抽奖 定时 20:00"))))
     assert "群号必须是纯数字" in out
+
+
+# ------------------------------------------------------- 每个群期数独立
+
+
+def test_raffle_numbering_is_per_group(plugin: GroupLotteryPlugin):
+    """期号按群独立编号，而不是全局累加。"""
+    other_umo = f"{PLATFORM_ID}:GroupMessage:999999"
+
+    # 本群第 1 期
+    out = texts_of(run(send(plugin, admin_event("抽奖 发布 月卡"))))
+    assert "第 1 期" in out
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    # 另一个群发布，也应该是第 1 期
+    out = texts_of(
+        run(send(plugin, admin_event("抽奖 发布 点卡", group_id="999999"))),
+    )
+    assert "第 1 期" in out
+    assert plugin.db.get_open_raffle(other_umo)["seq"] == 1
+    # 内部主键是全局的，两场不能撞
+    assert plugin.db.get_open_raffle(other_umo)["id"] != 1
+
+    # 本群第 2 期
+    out = texts_of(run(send(plugin, admin_event("抽奖 发布 季卡"))))
+    assert "第 2 期" in out
+    assert plugin.db.get_open_raffle(GROUP_UMO)["seq"] == 2
+
+
+def test_records_show_per_group_number(plugin: GroupLotteryPlugin):
+    """中奖记录里的期号也要用群内期号，而不是全局 id。"""
+    # 先让另一个群开一场，把全局 id 顶到 1
+    run(send(plugin, admin_event("抽奖 发布 点卡", group_id="999999")))
+    run(
+        send(
+            plugin,
+            FakeEvent("抽奖 参与", user_id="2002", nickname="乙", group_id="999999"),
+        )
+    )
+    run(send(plugin, admin_event("抽奖 开奖", group_id="999999")))
+
+    # 本群这场全局 id 会是 2，但群内期号仍是第 1 期
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    local = plugin.db.get_open_raffle(GROUP_UMO)
+    assert local["id"] == 2 and local["seq"] == 1
+
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    out = texts_of(run(send(plugin, admin_event("抽奖 记录"))))
+    assert "第 1 期" in out
+    assert "第 2 期" not in out
 
 
 # ------------------------------------------- unique_session（会话隔离）回归

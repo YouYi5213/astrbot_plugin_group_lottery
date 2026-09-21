@@ -8,6 +8,36 @@ from typing import Any
 from .models import KIND_KEY
 from .timeparse import format_ts, humanize_remaining
 
+
+def raffle_no(raffle: dict[str, Any] | None) -> int:
+    """取该场抽奖在**本群内**的期号（从 1 开始）。
+
+    ``raffles.id`` 是跨群全局自增的内部主键，对用户没有意义；展示一律用按群
+    独立编号的 ``seq``。老数据缺 ``seq`` 时回退到 ``id``，保证不会显示成 0。
+
+    Args:
+        raffle: 抽奖行（或含 ``seq`` / ``raffle_seq`` 的衍生行）。
+
+    Returns:
+        群内期号；拿不到时返回 0。
+    """
+    if not raffle:
+        return 0
+    for key in ("seq", "raffle_seq", "id", "raffle_id"):
+        value = raffle.get(key)
+        if value:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
+def raffle_label(raffle: dict[str, Any] | None) -> str:
+    """生成「第 N 期」文案。"""
+    return f"第 {raffle_no(raffle)} 期"
+
+
 # 帮助文本：主命令 + 子命令说明（权限, 用法, 说明）
 HELP_ROWS: list[tuple[str, str, str]] = [
     ("所有人", "抽奖 参与", "报名参加当前抽奖（也可用「抽奖 报名」）"),
@@ -16,10 +46,20 @@ HELP_ROWS: list[tuple[str, str, str]] = [
     ("所有人", "抽奖 名单", "查看已报名成员"),
     ("所有人", "抽奖 记录", "查看本群最近的开奖结果"),
     ("所有人", "抽奖 领取", "补领自己还没收到的密钥（私聊机器人发送即可）"),
-    ("管理员", "抽奖 发布 <奖品名> [名额]", "发布一场新抽奖，名额省略时为 1"),
+    ("管理员", "抽奖 发布 <奖品名> [名额] [选项…]", "发布一场新抽奖，选项可一次写完"),
     (
         "管理员",
-        "私聊：抽奖 密钥 <场次号>",
+        "私聊：抽奖 发布 <群号> <奖品名> [名额] [选项…]",
+        "在指定群发布并自动播报，如「抽奖 发布 754797467 月卡 2 定时 20:00 满员 8」",
+    ),
+    (
+        "管理员",
+        "选项：名额 / 定时 / 满员 / 私聊 / 说明",
+        "名额 3 · 定时 20:00 · 满员 8 · 私聊 开 · 说明 手慢无",
+    ),
+    (
+        "管理员",
+        "私聊：抽奖 密钥 <群号>",
         "在私聊里另起一行粘贴密钥，一行一条；密钥不会经过群聊",
     ),
     (
@@ -153,7 +193,7 @@ def build_status(
         return "当前没有进行中的抽奖。管理员可发送「抽奖 发布 <奖品名>」发起一场。"
 
     lines = [
-        f"🎁 当前抽奖 ·「{raffle.get('title', '')}」（第 {raffle.get('id')} 期）",
+        f"🎁 当前抽奖 ·「{raffle.get('title', '')}」（{raffle_label(raffle)}）",
         f"中奖名额：{raffle.get('winner_count', 1)} 名",
         f"已报名：{participant_count} 人",
     ]
@@ -207,7 +247,7 @@ def build_records(
         name = row.get("name") or row.get("user_id")
         prize = f" · {row['prize']}" if row.get("prize") else ""
         lines.append(
-            f"· [{when}] 第 {row.get('raffle_id')} 期「{row.get('title', '')}」→ {name}{prize}"
+            f"· [{when}] {raffle_label(row)}「{row.get('title', '')}」→ {name}{prize}"
         )
     return "\n".join(lines)
 

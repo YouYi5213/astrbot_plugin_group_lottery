@@ -15,6 +15,7 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.web import json_response, request
 
+from .core import texts
 from .core.engine import parse_keys
 from .core.models import KIND_KEY, STATUS_CANCELLED, STATUS_LABELS, TRIGGER_LABELS
 from .core.timeparse import format_ts
@@ -40,6 +41,8 @@ def _decorate(raffle: dict[str, Any]) -> dict[str, Any]:
     item["draw_at_str"] = format_ts(item.get("draw_at"))
     item["created_at_str"] = format_ts(item.get("created_at"))
     item["drawn_at_str"] = format_ts(item.get("drawn_at"))
+    # 面板展示用群内期号；raffle.id 仍是内部主键（接口按它取详情）
+    item["seq"] = texts.raffle_no(item)
     return item
 
 
@@ -47,6 +50,7 @@ def _decorate_winner(row: dict[str, Any]) -> dict[str, Any]:
     """给中奖记录补充展示字段。"""
     item = dict(row)
     item["time_str"] = format_ts(item.get("created_at"))
+    item["raffle_seq"] = texts.raffle_no(item)
     return item
 
 

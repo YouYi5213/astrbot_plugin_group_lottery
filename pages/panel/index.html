@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -333,7 +333,7 @@ function tableOfOpen(rows) {
       <th>期次</th><th>群号</th><th>奖品</th><th>名额</th><th>报名</th>
       <th>形式</th><th>自动开奖</th><th>操作</th></tr></thead>
     <tbody>${rows.map(r => `<tr>
-      <td class="mono">#${r.id}</td>
+      <td class="mono">#${r.seq}</td>
       <td class="mono">${esc(r.group_id)}</td>
       <td>${esc(r.title)}</td>
       <td>${Number(r.winner_count || 1)}</td>
@@ -343,9 +343,9 @@ function tableOfOpen(rows) {
             : `<span class="pill contact">联系群主</span>`}</td>
       <td class="hint">${esc(r.draw_at_str || "手动")}</td>
       <td><div class="row-actions">
-        <button data-detail="${r.id}">详情</button>
-        <button class="primary" data-draw="${r.id}">开奖</button>
-        <button class="danger" data-cancel="${r.id}">取消</button>
+        <button data-detail="${r.id}" data-seq="${r.seq}">详情</button>
+        <button class="primary" data-draw="${r.id}" data-seq="${r.seq}">开奖</button>
+        <button class="danger" data-cancel="${r.id}" data-seq="${r.seq}">取消</button>
       </div></td></tr>`).join("")}</tbody></table>`;
 }
 
@@ -366,7 +366,7 @@ async function loadRaffles() {
         <th>期次</th><th>群号</th><th>奖品</th><th>状态</th><th>名额</th>
         <th>报名</th><th>密钥</th><th>创建</th><th>开奖</th><th>操作</th></tr></thead>
       <tbody>${rows.map(r => `<tr>
-        <td class="mono">#${r.id}</td>
+        <td class="mono">#${r.seq}</td>
         <td class="mono">${esc(r.group_id)}</td>
         <td>${esc(r.title)}</td>
         <td><span class="pill ${esc(r.status)}">${esc(r.status_label)}</span></td>
@@ -378,10 +378,10 @@ async function loadRaffles() {
         <td class="hint">${esc(r.created_at_str)}</td>
         <td class="hint">${esc(r.drawn_at_str || "—")}</td>
         <td><div class="row-actions">
-          <button data-detail="${r.id}">详情</button>
+          <button data-detail="${r.id}" data-seq="${r.seq}">详情</button>
           ${r.status === "open"
-            ? `<button class="primary" data-draw="${r.id}">开奖</button>
-               <button class="danger" data-cancel="${r.id}">取消</button>` : ""}
+            ? `<button class="primary" data-draw="${r.id}" data-seq="${r.seq}">开奖</button>
+               <button class="danger" data-cancel="${r.id}" data-seq="${r.seq}">取消</button>` : ""}
         </div></td></tr>`).join("")}</tbody></table>`
     : `<div class="empty">没有符合条件的场次</div>`;
   bindRowActions($("raffle-list"));
@@ -389,11 +389,11 @@ async function loadRaffles() {
 
 function bindRowActions(scope) {
   scope.querySelectorAll("[data-detail]").forEach(b => {
-    b.onclick = () => openDetail(b.dataset.detail);
+    b.onclick = () => openDetail(b.dataset.detail, b.dataset.seq);
   });
   scope.querySelectorAll("[data-draw]").forEach(b => {
     b.onclick = async () => {
-      if (!confirm(`确认立即为第 ${b.dataset.draw} 期开奖？开奖后无法撤销。`)) return;
+      if (!confirm(`确认立即为第 ${b.dataset.seq} 期开奖？开奖后无法撤销。`)) return;
       b.disabled = true;
       const res = await apiPost("raffle/draw", { raffle_id: Number(b.dataset.draw) });
       if (res.status === "ok") { toast("已开奖，请在群里查看结果"); refreshAll(); }
@@ -402,7 +402,7 @@ function bindRowActions(scope) {
   });
   scope.querySelectorAll("[data-cancel]").forEach(b => {
     b.onclick = async () => {
-      if (!confirm(`确认取消第 ${b.dataset.cancel} 期抽奖？`)) return;
+      if (!confirm(`确认取消第 ${b.dataset.seq} 期抽奖？`)) return;
       const res = await apiPost("raffle/cancel", { raffle_id: Number(b.dataset.cancel) });
       if (res.status === "ok") { toast("已取消"); refreshAll(); } else showError(res);
     };
@@ -411,10 +411,10 @@ function bindRowActions(scope) {
 
 /* ---------------------------------------------------------------- 详情 */
 
-async function openDetail(id) {
+async function openDetail(id, seq) {
   $("drawer").classList.add("show");
   $("mask").classList.add("show");
-  $("drawer-title").textContent = `第 ${id} 期详情`;
+  $("drawer-title").textContent = seq ? `第 ${seq} 期详情` : "场次详情";
   $("drawer-body").innerHTML = `<div class="empty">加载中…</div>`;
 
   const res = await apiGet("raffle/" + id);
@@ -423,6 +423,7 @@ async function openDetail(id) {
     return;
   }
   const { raffle = {}, participants = [], winners = [], keys = [] } = res.data || {};
+  if (!seq && raffle.seq) $("drawer-title").textContent = `第 ${raffle.seq} 期详情`;
   const free = keys.filter(k => !k.assigned_to);
   const assigned = keys.filter(k => k.assigned_to);
 
@@ -452,8 +453,8 @@ async function openDetail(id) {
         <div class="k">创建 / 开奖</div><div class="hint">${esc(raffle.created_at_str)} / ${esc(raffle.drawn_at_str || "—")}</div>
       </div>
       ${raffle.status === "open" ? `<div class="row-actions" style="margin-top:14px">
-        <button class="primary" data-draw="${raffle.id}">立即开奖</button>
-        <button class="danger" data-cancel="${raffle.id}">取消抽奖</button>
+        <button class="primary" data-draw="${raffle.id}" data-seq="${raffle.seq}">立即开奖</button>
+        <button class="danger" data-cancel="${raffle.id}" data-seq="${raffle.seq}">取消抽奖</button>
       </div>` : ""}
     </div>
 
@@ -511,7 +512,7 @@ async function openDetail(id) {
         raffle_id: Number(raffle.id), keys: text, mode: $("key-mode").value,
       });
       saveBtn.disabled = false;
-      if (r.status === "ok") { toast(r.message || "已保存"); openDetail(raffle.id); refreshAll(); }
+      if (r.status === "ok") { toast(r.message || "已保存"); openDetail(raffle.id, raffle.seq); refreshAll(); }
       else showError(r);
     };
   }
@@ -537,7 +538,7 @@ async function loadWinners() {
         <th>中奖者</th><th>用户 ID</th><th>密钥</th><th>状态</th></tr></thead>
       <tbody>${rows.map(w => `<tr>
         <td class="hint">${esc(w.time_str)}</td>
-        <td class="mono">#${w.raffle_id}</td>
+        <td class="mono">#${w.raffle_seq}</td>
         <td class="mono">${esc(w.group_id)}</td>
         <td>${esc(w.title)}</td>
         <td>${esc(w.name || "")}</td>

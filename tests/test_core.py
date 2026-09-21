@@ -15,6 +15,7 @@ import pytest
 
 # sys.path 由同目录的 conftest.py 统一注入，这里直接按包名导入即可
 from core import texts
+from core.args import PublishParseError, parse_publish
 from core.db import LotteryDB
 from core.engine import available_seats, draw, parse_keys
 from core.models import KIND_CONTACT, KIND_KEY, STATUS_DRAWN, STATUS_OPEN
@@ -460,3 +461,157 @@ def test_build_help_lists_core_commands():
     assert "抽奖 参与" in text
     assert "抽奖 开奖" in text
     assert "抽奖 密钥" in text
+
+
+# ------------------------------------------------------------- 群内期号
+
+
+def test_raffle_no_prefers_seq():
+    """展示一律用群内期号 seq，而不是跨群全局自增的 id。"""
+    assert texts.raffle_no({"id": 99, "seq": 3}) == 3
+    assert texts.raffle_no({"raffle_id": 99, "raffle_seq": 4}) == 4
+    # 老数据缺 seq 时回退到 id，避免显示成 0
+    assert texts.raffle_no({"id": 7}) == 7
+    assert texts.raffle_no(None) == 0
+    assert texts.raffle_label({"seq": 3}) == "第 3 期"
+
+
+def test_seq_is_independent_per_group(db: LotteryDB):
+    """每个群的期数独立从 1 开始，而不是全局累加。"""
+    a1 = db.create_raffle(umo="aiocqhttp:GroupMessage:111", group_id="111", title="A1")
+    a2 = db.create_raffle(umo="aiocqhttp:GroupMessage:111", group_id="111", title="A2")
+    b1 = db.create_raffle(umo="aiocqhttp:GroupMessage:222", group_id="222", title="B1")
+    c1 = db.create_raffle(umo="aiocqhttp:GroupMessage:333", group_id="333", title="C1")
+    b2 = db.create_raffle(umo="aiocqhttp:GroupMessage:222", group_id="222", title="B2")
+
+    assert [db.get_raffle(i)["seq"] for i in (a1, a2)] == [1, 2]
+    assert [db.get_raffle(i)["seq"] for i in (b1, b2)] == [1, 2]
+    assert db.get_raffle(c1)["seq"] == 1
+    # 内部主键仍是全局唯一，供参与者 / 密钥 / 中奖记录关联
+    assert len({a1, a2, b1, b2, c1}) == 5
+
+
+def test_seq_backfilled_for_existing_rows(db: LotteryDB):
+    """老库没有 seq 列时，启动迁移要补列并按群回填。"""
+    for group_id, title, created in (
+        ("111", "旧A", 1),
+        ("222", "旧B", 2),
+        ("111", "旧C", 3),
+    ):
+        db._conn.execute(
+            "INSERT INTO raffles (umo, group_id, title, created_at) VALUES (?, ?, ?, ?)",
+            (f"aiocqhttp:GroupMessage:{group_id}", group_id, title, created),
+        )
+    db._conn.execute("UPDATE raffles SET seq = 0")
+    db._conn.commit()
+
+    db.close()
+    reopened = LotteryDB(db.path)
+    try:
+        rows = {r["title"]: r["seq"] for r in reopened.list_raffles(limit=10)}
+        assert rows == {"旧A": 1, "旧C": 2, "旧B": 1}
+        # 新场次接在回填结果之后
+        new_id = reopened.create_raffle(
+            umo="aiocqhttp:GroupMessage:111", group_id="111", title="新D"
+        )
+        assert reopened.get_raffle(new_id)["seq"] == 3
+    finally:
+        reopened.close()
+
+
+def test_winners_carry_raffle_seq(db: LotteryDB):
+    """中奖记录要带出群内期号，供「抽奖 记录」展示。"""
+    umo = "aiocqhttp:GroupMessage:111"
+    rid = db.create_raffle(umo=umo, group_id="111", title="月卡")
+    db.add_winners(
+        rid,
+        [
+            {
+                "umo": umo,
+                "group_id": "111",
+                "user_id": "1001",
+                "name": "甲",
+                "title": "月卡",
+                "prize": "KEY-1",
+            }
+        ],
+    )
+    rows = db.list_winners(raffle_id=rid)
+    assert rows[0]["raffle_seq"] == 1
+    assert texts.raffle_no(rows[0]) == 1
+    assert "第 1 期" in texts.build_records(rows, group_id="111")
+
+
+# --------------------------------------------------------- 一行式发布解析
+
+
+def test_parse_publish_one_liner():
+    """用户给的例子：抽奖 发布 754797467 支付宝口令红包5元 2 定时 20:00 满员 8。"""
+    spec = parse_publish("支付宝口令红包5元 2 定时 20:00 满员 8")
+    assert spec.title == "支付宝口令红包5元"
+    assert spec.winner_count == 2
+    assert spec.draw_at_text == "20:00"
+    assert spec.min_players == 8
+    assert spec.description == ""
+    assert spec.private_notify is None
+
+
+def test_parse_publish_minimal():
+    spec = parse_publish("月卡")
+    assert spec.title == "月卡"
+    assert spec.winner_count is None
+    assert spec.draw_at_text == ""
+    assert spec.min_players is None
+
+
+def test_parse_publish_positional_seats():
+    spec = parse_publish("月卡 3")
+    assert spec.title == "月卡"
+    assert spec.winner_count == 3
+
+
+def test_parse_publish_title_with_digits():
+    """奖品名里带数字不能被误当成名额。"""
+    spec = parse_publish("5元红包")
+    assert spec.title == "5元红包"
+    assert spec.winner_count is None
+
+    spec = parse_publish("5元红包 2")
+    assert spec.title == "5元红包"
+    assert spec.winner_count == 2
+
+
+def test_parse_publish_all_options():
+    spec = parse_publish("月卡 3 名额 5 定时 12-31 20:00 满员 10 私聊 开 说明 手慢无")
+    assert spec.title == "月卡"
+    assert spec.winner_count == 5  # 「名额」覆盖位置参数
+    assert spec.draw_at_text == "12-31 20:00"  # 带空格的时间要整体取到
+    assert spec.min_players == 10
+    assert spec.private_notify is True
+    assert spec.description == "手慢无"
+
+
+def test_parse_publish_relative_time_and_off_switches():
+    spec = parse_publish("月卡 定时 +2h 满员 关 私聊 关")
+    assert spec.draw_at_text == "+2h"
+    assert spec.min_players is None
+    assert spec.private_notify is False
+
+
+def test_parse_publish_rejects_bad_input():
+    with pytest.raises(PublishParseError):
+        parse_publish("")
+    with pytest.raises(PublishParseError):
+        parse_publish("月卡 0")
+    with pytest.raises(PublishParseError):
+        parse_publish("月卡 满员 1")
+    with pytest.raises(PublishParseError):
+        parse_publish("月卡 满员 abc")
+    with pytest.raises(PublishParseError):
+        parse_publish("月卡 定时")
+    with pytest.raises(PublishParseError):
+        parse_publish("月卡 私聊 也许")
+    with pytest.raises(PublishParseError):
+        parse_publish("月卡 说明")
+    with pytest.raises(PublishParseError):
+        parse_publish("x" * 61)
