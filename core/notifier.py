@@ -25,9 +25,41 @@ def platform_of(umo: str) -> str:
 
 
 def group_id_of(umo: str) -> str:
-    """取 unified_msg_origin 里的会话 ID（群聊时为群号）。"""
+    """取 unified_msg_origin 里的会话 ID（群聊时为群号）。
+
+    AstrBot 开启 ``unique_session`` 后，群消息的会话段是
+    ``{用户ID}_{群号}``（见 ``pipeline/waking_check/stage.py``），因此取最后
+    一段才是真正的群号——各平台适配器的 ``send_by_session`` 也是这么切的。
+    """
     parts = (umo or "").split(":")
-    return parts[2] if len(parts) >= 3 else (parts[-1] if parts else "")
+    if len(parts) < 3:
+        return parts[-1] if parts else ""
+    return parts[2].split("_")[-1]
+
+
+def group_umo(event: Any) -> str:
+    """构造与 ``unique_session`` 无关的「群级」会话标识。
+
+    抽奖是**群级**资源：同一个群里所有人都必须看到同一场抽奖。而
+    ``event.unified_msg_origin`` 在开启 ``unique_session`` 时会变成按用户隔离的
+    ``{platform}:GroupMessage:{用户ID}_{群号}``，直接拿它当键会让每个人各看到一场
+    抽奖。这里统一改用 ``event.get_group_id()``（真实群号）拼出规范标识。
+
+    Args:
+        event: 当前消息事件。
+
+    Returns:
+        形如 ``aiocqhttp:GroupMessage:762429641`` 的会话标识；拿不到群号时
+        （例如私聊）回退为事件自身的 ``unified_msg_origin``。
+    """
+    group_id = ""
+    try:
+        group_id = str(event.get_group_id() or "")
+    except Exception:
+        group_id = ""
+    if not group_id:
+        return str(getattr(event, "unified_msg_origin", "") or "")
+    return f"{event.get_platform_id()}:GroupMessage:{group_id}"
 
 
 def private_umo(platform_id: str, user_id: str) -> str:

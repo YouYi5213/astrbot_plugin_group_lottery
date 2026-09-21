@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from astrbot.api import logger
+
 from .models import KIND_CONTACT, STATUS_OPEN
 
 _SCHEMA = """
@@ -113,7 +115,36 @@ class LotteryDB:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
+            self._migrate_session_isolation()
             self._conn.commit()
+
+    def _migrate_session_isolation(self) -> None:
+        """把受 ``unique_session`` 污染的群标识修正回真实群号。
+
+        v1.0.0 早期版本直接拿 ``event.unified_msg_origin`` 当群标识。AstrBot 开启
+        ``unique_session`` 后，群消息的会话段是 ``{用户ID}_{群号}``，于是同一群里
+        每个人各存了一份互不可见的抽奖。这里把历史行归一化，避免用户升级后数据作废。
+
+        群号本身不含下划线（QQ 群号是纯数字，各平台适配器也按 ``split("_")[-1]``
+        还原群号），因此只要会话段含下划线就一定是被隔离过的。
+        """
+        try:
+            rows = self._conn.execute(
+                "SELECT id, umo, group_id FROM raffles WHERE group_id LIKE '%\\_%' ESCAPE '\\'",
+            ).fetchall()
+            for row in rows:
+                group_id = str(row["group_id"]).split("_")[-1]
+                platform = str(row["umo"]).split(":", 1)[0] or "aiocqhttp"
+                self._conn.execute(
+                    "UPDATE raffles SET umo = ?, group_id = ? WHERE id = ?",
+                    (f"{platform}:GroupMessage:{group_id}", group_id, row["id"]),
+                )
+                self._conn.execute(
+                    "UPDATE winners SET umo = ?, group_id = ? WHERE raffle_id = ?",
+                    (f"{platform}:GroupMessage:{group_id}", group_id, row["id"]),
+                )
+        except Exception as exc:  # pragma: no cover - 迁移失败不应阻断启动
+            logger.warning(f"[群抽奖] 历史会话标识迁移失败（可忽略）：{exc}")
 
     # ------------------------------------------------------------------ 基础
 

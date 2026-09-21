@@ -58,7 +58,12 @@ class _MessageObj:
 
 
 class FakeEvent:
-    """最小可用的 AstrMessageEvent 替身。"""
+    """最小可用的 AstrMessageEvent 替身。
+
+    ``unique_session=True`` 复刻 AstrBot 开启会话隔离时的行为：群消息的
+    ``unified_msg_origin`` 会话段变成 ``{用户ID}_{群号}``（见
+    ``pipeline/waking_check/stage.py``），而 ``get_group_id()`` 仍是真实群号。
+    """
 
     def __init__(
         self,
@@ -70,6 +75,7 @@ class FakeEvent:
         private: bool = False,
         role: str = "member",
         is_admin: bool = False,
+        unique_session: bool = False,
     ) -> None:
         self.message_str = message_str
         self._sender = _Sender(user_id, nickname, role)
@@ -80,10 +86,16 @@ class FakeEvent:
         self._stopped = False
         self.bot = None
         self.message_obj = _MessageObj(self._sender, group_id, private)
+        if private:
+            session_id = user_id
+        elif unique_session:
+            session_id = f"{user_id}_{group_id}"
+        else:
+            session_id = group_id
         self.unified_msg_origin = (
-            f"{PLATFORM_ID}:FriendMessage:{user_id}"
+            f"{PLATFORM_ID}:FriendMessage:{session_id}"
             if private
-            else f"{PLATFORM_ID}:GroupMessage:{group_id}"
+            else f"{PLATFORM_ID}:GroupMessage:{session_id}"
         )
 
     # --- AstrBot 事件接口子集 ---
@@ -788,6 +800,143 @@ def test_private_commands_need_group_id(plugin: GroupLotteryPlugin):
     # 把时间当群号写会被明确拒绝
     out = texts_of(run(send(plugin, private_admin_event("抽奖 定时 20:00"))))
     assert "群号必须是纯数字" in out
+
+
+# ------------------------------------------- unique_session（会话隔离）回归
+
+
+def test_unique_session_group_raffle_is_shared(plugin: GroupLotteryPlugin):
+    """开启 unique_session 时，同群不同用户必须看到同一场抽奖。
+
+    回归：早期版本拿 ``event.unified_msg_origin`` 当群标识，而它在会话隔离下是
+    ``{用户ID}_{群号}``，导致抽奖被存成「每人一份」，别人无法参与。
+    """
+    # 管理员在群里发布
+    run(send(plugin, admin_event("抽奖 发布 月卡 2", unique_session=True)))
+
+    raffle = plugin.db.get_open_raffle(GROUP_UMO)
+    assert raffle is not None, "抽奖必须落在群级会话下"
+    assert raffle["group_id"] == GROUP_ID, "群号不应带用户前缀"
+
+    # 另一个用户参与
+    out = texts_of(
+        run(
+            send(
+                plugin,
+                FakeEvent(
+                    "抽奖 参与",
+                    user_id="2002",
+                    nickname="乙",
+                    unique_session=True,
+                ),
+            )
+        )
+    )
+    assert "报名成功" in out
+    assert plugin.db.count_participants(1) == 1
+
+    # 第三个用户能看到状态
+    out = texts_of(
+        run(
+            send(
+                plugin,
+                FakeEvent("抽奖 状态", user_id="3003", unique_session=True),
+            )
+        )
+    )
+    assert "月卡" in out
+    assert "1 人" in out or "1/" in out
+
+
+def test_unique_session_private_publish_then_group_join(
+    plugin: GroupLotteryPlugin,
+):
+    """路线 A + 会话隔离：私聊发布后，群里任何人都能参与。"""
+    run(send(plugin, private_admin_event(f"抽奖 发布 {GROUP_ID} 月卡 1")))
+
+    out = texts_of(
+        run(
+            send(
+                plugin,
+                FakeEvent(
+                    "抽奖 参与", user_id="2002", nickname="乙", unique_session=True
+                ),
+            )
+        )
+    )
+    assert "报名成功" in out
+
+    # 私聊按群号设置密钥也应命中同一场
+    assert "已设置 1 条密钥" in set_keys(plugin, "UNIQUE-KEY")
+    assert plugin.db.count_keys(1) == 1
+
+
+def test_unique_session_draw_delivers_to_real_group(plugin: GroupLotteryPlugin):
+    """会话隔离下开奖：公告要发到群级会话，而不是某个用户的隔离会话。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 1", unique_session=True)))
+    set_keys(plugin, "UNIQUE-KEY")
+    run(
+        send(
+            plugin,
+            FakeEvent("抽奖 参与", user_id="2002", nickname="乙", unique_session=True),
+        )
+    )
+    run(send(plugin, admin_event("抽奖 开奖", unique_session=True)))
+
+    sessions = [s for s, _ in plugin.context.sent]
+    assert GROUP_UMO in sessions, f"公告应发往 {GROUP_UMO}，实际发往 {sessions}"
+    assert not any("_888888" in s for s in sessions), "不应发往按用户隔离的会话"
+    assert "UNIQUE-KEY" in "\n".join(sent_texts(plugin))
+
+
+def test_group_id_of_strips_user_prefix():
+    """group_id_of 对隔离会话也要还原出真实群号（历史数据兼容）。"""
+    from astrbot_plugin_group_lottery.core.notifier import group_id_of, group_umo
+
+    assert group_id_of("aiocqhttp:GroupMessage:1626810822_762429641") == "762429641"
+    assert group_id_of("aiocqhttp:GroupMessage:762429641") == "762429641"
+    assert group_id_of("") == ""
+
+    class _E:
+        def get_group_id(self):
+            return "762429641"
+
+        def get_platform_id(self):
+            return "aiocqhttp"
+
+        unified_msg_origin = "aiocqhttp:GroupMessage:1626810822_762429641"
+
+    assert group_umo(_E()) == "aiocqhttp:GroupMessage:762429641"
+
+
+def test_db_migrates_isolated_rows(plugin: GroupLotteryPlugin, tmp_path=None):
+    """升级后历史数据要能自动归一化，而不是作废。"""
+    # 手工插入一条被 unique_session 污染的记录
+    plugin.db._conn.execute(
+        "INSERT INTO raffles (umo, group_id, title, created_at) VALUES (?, ?, ?, ?)",
+        (
+            "aiocqhttp:GroupMessage:1626810822_762429641",
+            "1626810822_762429641",
+            "旧抽奖",
+            1,
+        ),
+    )
+    plugin.db._conn.commit()
+
+    # 重新打开数据库会触发迁移
+    from astrbot_plugin_group_lottery.core.db import LotteryDB
+
+    db_path = plugin.db.path
+    plugin.db.close()
+    migrated = LotteryDB(db_path)
+    try:
+        row = migrated.get_raffle(1)
+        assert row["group_id"] == "762429641"
+        assert row["umo"] == "aiocqhttp:GroupMessage:762429641"
+        assert migrated.get_open_raffle("aiocqhttp:GroupMessage:762429641") is not None
+    finally:
+        migrated.close()
+    plugin.db = LotteryDB(db_path)
 
 
 def test_group_blacklist_blocks_commands(plugin: GroupLotteryPlugin):

@@ -41,6 +41,7 @@ from .core.models import (
 from .core.notifier import (
     get_bot_groups,
     group_id_of,
+    group_umo,
     platform_of,
     platform_supports_at,
     send_group_text,
@@ -423,7 +424,7 @@ class GroupLotteryPlugin(Star):
                 )
                 return
 
-            if not is_private and not self._group_allowed(event.unified_msg_origin):
+            if not is_private and not self._group_allowed(group_umo(event)):
                 return
 
             if need_admin and not is_private and not self._is_admin(event):
@@ -506,7 +507,7 @@ class GroupLotteryPlugin(Star):
             ValueError: 私聊里没写群号、群号非法，或机器人不在该群。
         """
         if not event.is_private_chat():
-            umo = event.unified_msg_origin
+            umo = group_umo(event)
             return umo, group_id_of(umo), "", (tail or "").strip()
 
         group_id, body = _take_group_id(tail)
@@ -594,16 +595,16 @@ class GroupLotteryPlugin(Star):
                 )
             yield event.plain_result("\n".join(lines))
             return
-        rows = self.db.list_winners(umo=event.unified_msg_origin, limit=30)
+        rows = self.db.list_winners(umo=group_umo(event), limit=30)
         yield event.plain_result(
-            texts.build_records(rows, group_id=group_id_of(event.unified_msg_origin)),
+            texts.build_records(rows, group_id=group_id_of(group_umo(event))),
         )
 
     async def _h_join(
         self, event: AstrMessageEvent, tail: str
     ) -> AsyncGenerator[Any, None]:
         """报名参加当前抽奖。"""
-        umo = event.unified_msg_origin
+        umo = group_umo(event)
         raffle = self._open_raffle(umo)
         if not raffle:
             yield event.plain_result("当前没有进行中的抽奖，等管理员发布后再来吧～")
@@ -635,7 +636,7 @@ class GroupLotteryPlugin(Star):
         self, event: AstrMessageEvent, tail: str
     ) -> AsyncGenerator[Any, None]:
         """取消自己的报名。"""
-        umo = event.unified_msg_origin
+        umo = group_umo(event)
         raffle = self._open_raffle(umo)
         if not raffle:
             yield event.plain_result("当前没有进行中的抽奖。")
@@ -650,7 +651,7 @@ class GroupLotteryPlugin(Star):
     ) -> AsyncGenerator[Any, None]:
         """补领 / 查看自己的密钥奖品。"""
         uid = str(event.get_sender_id())
-        umo = None if event.is_private_chat() else event.unified_msg_origin
+        umo = None if event.is_private_chat() else group_umo(event)
         rows = self.db.list_winners(user_id=uid, umo=umo, limit=10)
 
         if not rows:
