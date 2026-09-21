@@ -131,8 +131,12 @@ class Context:
         self.platform_manager = types.SimpleNamespace(platform_insts=[])
         self.sent: list[tuple[str, MessageChain]] = []
         self.web_apis: list[tuple] = []
+        # 测试可用：让私聊投递失败，模拟「未加好友 / 被风控」
+        self.fail_private = False
 
     async def send_message(self, session, message_chain) -> bool:
+        if self.fail_private and "FriendMessage" in str(session):
+            return False
         self.sent.append((str(session), message_chain))
         return True
 

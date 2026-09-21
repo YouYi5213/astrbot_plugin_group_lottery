@@ -202,17 +202,20 @@ async def send_group_text(
         chain = build_at_chain(at_user_ids, text)
         if chain:
             try:
-                await context.send_message(umo, _wrap(chain))
-                return True
+                if await context.send_message(umo, _wrap(chain)) is not False:
+                    return True
             except Exception as exc:
                 logger.warning(f"[群抽奖] 真实 @ 发送失败，降级为纯文本：{exc}")
 
     try:
-        await context.send_message(umo, _wrap([mc.Plain(text)]))
-        return True
+        sent = await context.send_message(umo, _wrap([mc.Plain(text)]))
     except Exception as exc:
         logger.error(f"[群抽奖] 群消息发送失败：{exc}")
         return False
+    if sent is False:
+        logger.error(f"[群抽奖] 群消息发送失败：找不到平台适配器 {platform_of(umo)}")
+        return False
+    return True
 
 
 async def send_private_text(
@@ -227,18 +230,28 @@ async def send_private_text(
         text: 正文。
 
     Returns:
-        是否发送成功（用户未加好友、被风控、平台不支持主动私聊时返回 False）。
+        是否投递成功。判定依据有两条：
+
+        1. ``context.send_message`` 返回 False —— 没找到匹配的平台适配器；
+        2. 抛异常 —— aiocqhttp 下「未加好友 / 被风控」会让
+           ``bot.send_private_msg`` 抛 ``ActionFailed``，适配器不做捕获。
+
+        注意 ``Context.send_message`` 的返回值语义是「**是否找到平台**」而非
+        「是否送达」，适配器若自行吞掉错误，这里就感知不到。
     """
     mc = _components()
     if mc is None or not platform_id or not user_id:
         return False
     umo = private_umo(platform_id, user_id)
     try:
-        await context.send_message(umo, _wrap([mc.Plain(text)]))
-        return True
+        sent = await context.send_message(umo, _wrap([mc.Plain(text)]))
     except Exception as exc:
         logger.warning(f"[群抽奖] 私聊发送失败（{umo}）：{exc}")
         return False
+    if sent is False:
+        logger.warning(f"[群抽奖] 私聊发送失败：找不到平台适配器 {platform_id}")
+        return False
+    return True
 
 
 async def get_bot_groups(event: Any) -> dict[str, str] | None:

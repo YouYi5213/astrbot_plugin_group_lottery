@@ -2,7 +2,7 @@
 display_name: 群抽奖系统
 desc: 群聊抽奖系统：发布抽奖、报名参与、手动/定时/满员自动开奖，开奖后群内公布中奖名单并 @ 中奖者；支持密钥奖品，中奖者由机器人私聊直接发送专属密钥。管理员可从私聊按群号跨群管理，并提供可视化管理面板查看抽奖记录与密钥池。
 short_desc: 发布抽奖、自动开奖、私聊发密钥
-version: v1.1.0
+version: v1.1.1
 author: YouYi5213
 repo: https://github.com/YouYi5213/astrbot_plugin_group_lottery
 astrbot_version: ">=4.16"

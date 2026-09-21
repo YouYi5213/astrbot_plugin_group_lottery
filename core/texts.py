@@ -280,6 +280,45 @@ def build_publish_notice(
     return "\n".join(lines)
 
 
+def build_leftover_keys(
+    raffle: dict[str, Any],
+    keys: Sequence[str],
+    group_id: str = "",
+    reason: str = "",
+) -> str:
+    """生成「开奖后仍有密钥没送出」的管理员私聊提醒。
+
+    只发给发布者本人，因此可以带明文；群公告里只出现条数。
+
+    Args:
+        raffle: 抽奖记录。
+        keys: 未送出的密钥内容。
+        group_id: 群号。
+        reason: 为什么没送完（例如报名人数不足）。
+
+    Returns:
+        私聊文案。
+    """
+    lines = [
+        f"🔑 {raffle_label(raffle)}「{raffle.get('title', '')}」开奖后还有 "
+        f"{len(keys)} 条密钥没有送出",
+    ]
+    if group_id:
+        lines.append(f"群号：{group_id}")
+    if reason:
+        lines.append(f"原因：{reason}")
+    lines.append("")
+    lines.append("剩余密钥：")
+    lines.extend(f"{i}. {content}" for i, content in enumerate(keys, 1))
+    lines.append("")
+    lines.append("这些密钥仍保留在本场密钥池里，之后可以：")
+    if group_id:
+        lines.append(f"· 私聊发送「抽奖 密钥 {group_id} 查看」随时取回")
+    lines.append("· 在管理面板的场次详情里查看")
+    lines.append("· 不需要时用「抽奖 密钥 清空」清理掉")
+    return "\n".join(lines)
+
+
 def build_help(prefix: str = "/") -> str:
     """生成纯文本帮助（图片帮助渲染失败时的兜底）。"""
     lines = [

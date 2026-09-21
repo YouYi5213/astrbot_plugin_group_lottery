@@ -459,6 +459,20 @@ class GroupLotteryPlugin(Star):
             )
         return raffle
 
+    def _keys_raffle(self, umo: str, group_id: str) -> dict[str, Any]:
+        """取密钥操作的场次：优先进行中的，否则回退到本群最近一场。
+
+        开奖后密钥池里可能还剩没送出的密钥（名额没报满、密钥多设了等），
+        此时必须还能查看 / 清空，否则这些密钥就再也拿不回来了。
+        """
+        raffle = self._open_raffle(umo)
+        if raffle:
+            return raffle
+        recent = self.db.list_raffles(umo=umo, limit=1)
+        if recent:
+            return recent[0]
+        raise ValueError(f"群 {group_id} 还没有任何抽奖记录。")
+
     async def _ensure_bot_in_group(self, event: AstrMessageEvent, group_id: str) -> str:
         """确认机器人在指定群里，返回群名（拿不到时返回空串）。
 
@@ -861,13 +875,13 @@ class GroupLotteryPlugin(Star):
             return
 
         if body in ("查看", "list", "ls"):
-            raffle = self._require_open_raffle(umo)
+            raffle = self._keys_raffle(umo, group_id)
             async for result in self._send_remaining_keys(event, raffle, group_id):
                 yield result
             return
 
         if body in _KEY_CLEAR_WORDS:
-            raffle = self._require_open_raffle(umo)
+            raffle = self._keys_raffle(umo, group_id)
             raffle_id = int(raffle["id"])
             removed = self.db.clear_keys(raffle_id)
             self.db.update_raffle(raffle_id, prize_kind=KIND_CONTACT, private_notify=0)
@@ -925,14 +939,20 @@ class GroupLotteryPlugin(Star):
         """把剩余密钥私聊发给操作者（群里只回报结果，不显示明文）。"""
         raffle_id = int(raffle["id"])
         label = texts.raffle_label(raffle)
+        closed = str(raffle.get("status")) != "open"
         rows = self.db.list_keys(raffle_id)
         free = [r for r in rows if not r.get("assigned_to")]
         if not free:
             yield event.plain_result(f"{label}密钥池为空。")
             return
         scope = (f"群 {group_id} " if group_id else "") + label
+        if closed:
+            scope += "（已结束）"
         lines = [f"🔑 {scope}剩余密钥（{len(free)}/{len(rows)}）："]
         lines.extend(f"{i}. {r['content']}" for i, r in enumerate(free, 1))
+        if closed:
+            lines.append("")
+            lines.append("这些密钥未送出，可手动发给群友，或用「抽奖 密钥 清空」清理。")
         sent = await send_private_text(
             self.context,
             event.get_platform_id(),
@@ -1215,12 +1235,40 @@ class GroupLotteryPlugin(Star):
             draw_trigger=trigger,
         )
 
+        # 开奖后仍未送出的密钥：私聊告知发布者，避免密钥「失踪」
+        leftover = [k["content"] for k in self.db.list_free_keys(raffle_id)]
+        leftover_sent = False
+        if leftover:
+            reason = ""
+            if outcome.seat_shortage:
+                reason = (
+                    f"报名人数不足，{raffle.get('winner_count')} 个名额只抽出 "
+                    f"{outcome.winner_count} 位中奖者"
+                )
+            elif not deliver_privately:
+                reason = "本场未开启「私聊发密钥」，密钥池未被使用"
+            creator = str(raffle.get("created_by") or "")
+            if creator:
+                leftover_sent = await send_private_text(
+                    self.context,
+                    platform_id,
+                    creator,
+                    texts.build_leftover_keys(raffle, leftover, group_id, reason),
+                )
+
         # 组装公告
         notes: list[str] = []
         if outcome.seat_shortage:
             notes.append(f"报名人数不足，空缺 {outcome.seat_shortage} 个名额")
         if outcome.key_shortage:
             notes.append(f"密钥池不足，{outcome.key_shortage} 位中奖者暂未拿到密钥")
+        if leftover:
+            notes.append(
+                f"另有 {len(leftover)} 条密钥未送出，已私聊发给发布者"
+                if leftover_sent
+                else f"另有 {len(leftover)} 条密钥未送出，发布者可私聊机器人发送"
+                f"「抽奖 密钥 {group_id} 查看」取回"
+            )
         if failed_dm:
             notes.append(
                 "以下中奖者私聊发送失败，请主动私聊机器人发送「抽奖 领取」补领密钥："

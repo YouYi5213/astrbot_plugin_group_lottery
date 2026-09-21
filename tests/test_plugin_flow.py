@@ -594,17 +594,31 @@ def test_key_mode_private_delivery(plugin: GroupLotteryPlugin):
     assert keys <= {"KEY-AAA", "KEY-BBB", "KEY-CCC"}
     assert all(w["notified"] == 1 for w in winners)
 
-    # 私聊投递
-    private_sessions = [s for s, _ in plugin.context.sent if "FriendMessage" in s]
-    assert len(private_sessions) == 2
-    private_text = "\n".join(sent_texts(plugin))
-    for key in keys:
-        assert key in private_text
+    # 每位中奖者都会收到私聊
+    sent_sessions = [s for s, _ in plugin.context.sent]
+    for winner in winners:
+        assert f"aiocqhttp:FriendMessage:{winner['user_id']}" in sent_sessions
+
+    # 剩下的 1 条密钥私聊告知发布者（1001）
+    leftover = [k["content"] for k in plugin.db.list_free_keys(1)]
+    assert len(leftover) == 1
+    admin_text = "\n".join(sent_texts(plugin, "aiocqhttp:FriendMessage:1001"))
+    assert "还有 1 条密钥没有送出" in admin_text
+    assert leftover[0] in admin_text
+
+    # 中奖者的私聊里只出现自己那条密钥
+    for winner in winners:
+        own = "\n".join(
+            sent_texts(plugin, f"aiocqhttp:FriendMessage:{winner['user_id']}")
+        )
+        assert winner["prize"] in own
 
     # 群公告绝不出现密钥明文
     announce = sent_texts(plugin, GROUP_UMO)[-1]
     for key in ("KEY-AAA", "KEY-BBB", "KEY-CCC"):
         assert key not in announce
+    # 公告只提示条数，不泄露内容
+    assert "另有 1 条密钥未送出" in announce
 
 
 def test_key_shortage_is_reported(plugin: GroupLotteryPlugin):
@@ -618,6 +632,119 @@ def test_key_shortage_is_reported(plugin: GroupLotteryPlugin):
     # 名额被密钥池限制为 1
     assert len(winners) == 1
     assert winners[0]["prize"] == "ONLY-ONE"
+
+
+# ------------------------------------------------- 开奖后剩余密钥的归属
+
+
+def test_leftover_keys_dm_the_admin(plugin: GroupLotteryPlugin):
+    """3 个名额 3 条密钥，但只有 2 人报名 → 剩余密钥私聊告知发布者。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 3")))
+    set_keys(plugin, "KEY-AAA\nKEY-BBB\nKEY-CCC")
+    for uid, name in (("1001", "甲"), ("1002", "乙")):
+        run(send(plugin, FakeEvent("抽奖 参与", user_id=uid, nickname=name)))
+
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    winners = plugin.db.list_winners(raffle_id=1)
+    assert len(winners) == 2
+
+    leftover = [k["content"] for k in plugin.db.list_free_keys(1)]
+    assert len(leftover) == 1, "应该正好剩 1 条密钥"
+
+    # 发布者（1001）收到私聊提醒，且带明文与原因
+    admin_text = "\n".join(sent_texts(plugin, "aiocqhttp:FriendMessage:1001"))
+    assert "还有 1 条密钥没有送出" in admin_text
+    assert leftover[0] in admin_text
+    assert "报名人数不足" in admin_text
+    assert "抽奖 密钥 888888 查看" in admin_text
+
+    # 群里只出现条数，不出现明文
+    announce = sent_texts(plugin, GROUP_UMO)[-1]
+    assert "另有 1 条密钥未送出" in announce
+    for key in ("KEY-AAA", "KEY-BBB", "KEY-CCC"):
+        assert key not in announce
+
+
+def test_leftover_keys_viewable_after_draw(plugin: GroupLotteryPlugin):
+    """开奖后必须还能取回剩余密钥，否则这些密钥就丢了。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 3")))
+    set_keys(plugin, "KEY-AAA\nKEY-BBB\nKEY-CCC")
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    assert plugin.db.get_open_raffle(GROUP_UMO) is None, "开奖后没有进行中的抽奖"
+    plugin.context.sent.clear()
+
+    # 群里查看
+    out = texts_of(run(send(plugin, admin_event("抽奖 密钥 查看"))))
+    assert "已私聊发送" in out
+    got = "\n".join(sent_texts(plugin))
+    assert "已结束" in got
+    assert "剩余密钥" in got
+
+    # 私聊按群号查看同样可用
+    plugin.context.sent.clear()
+    out = set_keys(plugin, "查看")
+    assert "已私聊发送" in out
+    assert "剩余密钥" in "\n".join(sent_texts(plugin))
+
+
+def test_leftover_keys_clearable_after_draw(plugin: GroupLotteryPlugin):
+    """开奖后也能清空剩余密钥。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 2")))
+    set_keys(plugin, "KEY-AAA\nKEY-BBB")
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    out = texts_of(run(send(plugin, admin_event("抽奖 密钥 清空"))))
+    assert "已清空" in out
+    # 已发出去的那条保留，只清掉没送出的
+    assert plugin.db.count_keys(1, only_free=True) == 0
+    assert plugin.db.count_keys(1) == 1
+
+
+def test_leftover_reported_when_private_notify_off(plugin: GroupLotteryPlugin):
+    """设了密钥却关了私聊发奖：密钥没用上，也要告知发布者。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 1")))
+    set_keys(plugin, "UNUSED-KEY")
+    run(send(plugin, admin_event("抽奖 私聊 关")))
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    admin_text = "\n".join(sent_texts(plugin, "aiocqhttp:FriendMessage:1001"))
+    assert "还有 1 条密钥没有送出" in admin_text
+    assert "未开启「私聊发密钥」" in admin_text
+    assert plugin.db.list_free_keys(1), "关闭私聊发奖时不该消耗密钥"
+
+
+def test_no_leftover_dm_when_all_keys_used(plugin: GroupLotteryPlugin):
+    """密钥刚好发完时不应有多余私聊。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 2")))
+    set_keys(plugin, "KEY-AAA\nKEY-BBB")
+    for uid, name in (("1001", "甲"), ("1002", "乙")):
+        run(send(plugin, FakeEvent("抽奖 参与", user_id=uid, nickname=name)))
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    assert plugin.db.list_free_keys(1) == []
+    assert "还有" not in "\n".join(sent_texts(plugin, "aiocqhttp:FriendMessage:1001"))
+    announce = sent_texts(plugin, GROUP_UMO)[-1]
+    assert "未送出" not in announce
+
+
+def test_leftover_dm_falls_back_to_group_hint(plugin: GroupLotteryPlugin):
+    """发布者私聊不通时，公告里要给出自助取回的办法。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 3")))
+    set_keys(plugin, "KEY-AAA\nKEY-BBB\nKEY-CCC")
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+
+    plugin.context.fail_private = True
+    run(send(plugin, admin_event("抽奖 开奖")))
+    plugin.context.fail_private = False
+
+    announce = sent_texts(plugin, GROUP_UMO)[-1]
+    assert "另有 2 条密钥未送出" in announce
+    assert "抽奖 密钥 888888 查看" in announce
 
 
 def test_claim_resends_failed_key_in_private(plugin: GroupLotteryPlugin):
