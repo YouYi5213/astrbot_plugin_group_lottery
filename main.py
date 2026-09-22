@@ -40,6 +40,7 @@ from .core.models import (
     TRIGGER_SCHEDULED,
 )
 from .core.notifier import (
+    bot_is_group_admin,
     get_bot_groups,
     group_id_of,
     group_umo,
@@ -290,6 +291,10 @@ class GroupLotteryPlugin(Star):
     def _at_enabled(self) -> bool:
         """是否 @ 中奖者。"""
         return bool(self._cfg("at_winners", True))
+
+    def _at_all_on_publish(self) -> bool:
+        """发布抽奖后是否尝试 @全体成员（还需机器人本身是群管理员）。"""
+        return bool(self._cfg("at_all_on_publish", True))
 
     def _group_allowed(self, umo: str) -> bool:
         """群黑白名单判定。"""
@@ -820,15 +825,19 @@ class GroupLotteryPlugin(Star):
             )
         raffle = self.db.get_raffle(raffle_id) or {}
 
-        # 私聊发布时群里看不到任何痕迹，需要单独播报一条
-        announced = False
-        if from_private:
-            announced = await send_group_text(
-                self.context,
-                umo,
-                texts.build_publish_notice(raffle, group_id, group_name),
-                allow_at=False,
-            )
+        # 在群里播报一条抽奖信息。私聊发布时群里看不到命令痕迹，群聊发布时
+        # 回复是给管理员的（含密钥等管理指引），都不适合当成员看的公告，
+        # 因此两条路线统一发一条独立的公告；机器人是群管理员时顺带 @全体成员。
+        at_all = False
+        if self._at_all_on_publish():
+            at_all = await bot_is_group_admin(event, group_id)
+        announced = await send_group_text(
+            self.context,
+            umo,
+            texts.build_publish_notice(raffle, group_id, group_name),
+            allow_at=False,
+            at_all=at_all,
+        )
 
         where = f"群 {group_id}" + (f"（{group_name}）" if group_name else "")
         lines = [
@@ -842,12 +851,19 @@ class GroupLotteryPlugin(Star):
             lines.append(f"满员提前开奖：报名满 {spec.min_players} 人")
         if spec.description:
             lines.append(f"说明：{spec.description}")
-        if from_private:
+        if announced:
             lines.append(
-                "✅ 已在该群播报抽奖信息。"
-                if announced
-                else "⚠️ 群内播报发送失败，请检查机器人是否在群内。"
+                "✅ 已在群里播报并 @全体成员。"
+                if at_all
+                else "✅ 已在群里播报抽奖信息。"
+                + (
+                    ""
+                    if at_all or not self._at_all_on_publish()
+                    else "（机器人不是群管理员，无法 @全体成员）"
+                )
             )
+        else:
+            lines.append("⚠️ 群内播报发送失败，请检查机器人是否在群内。")
         lines.append("")
         lines.append("群友发送「抽奖 参与」即可报名。接下来可以：")
         lines.append(

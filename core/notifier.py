@@ -172,16 +172,80 @@ def _wrap(chain: list[Any]) -> Any:
     return chain
 
 
+def build_at_all_chain(text: str) -> list[Any] | None:
+    """构造「@全体成员 + 正文」的消息组件列表。
+
+    Args:
+        text: 正文。
+
+    Returns:
+        组件列表；平台组件不可用或缺少 ``AtAll`` 时返回 ``None``。
+    """
+    mc = _components()
+    if mc is None:
+        return None
+    at_all = getattr(mc, "AtAll", None)
+    if at_all is None:
+        return None
+    try:
+        return [at_all(), mc.Plain(" " + text)]
+    except Exception:
+        return None
+
+
+async def bot_is_group_admin(event: Any, group_id: str) -> bool:
+    """判断**机器人自己**在指定群里是不是管理员 / 群主。
+
+    QQ 只有管理员能 @全体成员，且每天有次数限制，所以先问清楚再决定要不要 @。
+
+    仅 OneBot 系（aiocqhttp）提供 ``get_group_member_info``；其它平台一律返回
+    ``False``，即降级为普通公告。
+
+    Args:
+        event: 当前消息事件（群聊 / 私聊均可，私聊也能拿到 ``bot`` 与 ``self_id``）。
+        group_id: 目标群号。
+
+    Returns:
+        机器人是否具备 @全体成员 的权限。
+    """
+    try:
+        if event.get_platform_name() != "aiocqhttp":
+            return False
+        bot = getattr(event, "bot", None)
+        self_id = str(event.get_self_id() or "")
+        if bot is None or not str(group_id).isdigit() or not self_id.isdigit():
+            return False
+        try:
+            info = await bot.get_group_member_info(
+                group_id=int(group_id),
+                user_id=int(self_id),
+                no_cache=True,
+            )
+        except TypeError:
+            # 少数协议端不认 no_cache 参数
+            info = await bot.get_group_member_info(
+                group_id=int(group_id),
+                user_id=int(self_id),
+            )
+    except Exception as exc:
+        logger.debug(f"[群抽奖] 查询机器人群身份失败（按非管理员处理）：{exc}")
+        return False
+    role = str((info or {}).get("role") or "")
+    return role in ("owner", "admin")
+
+
 async def send_group_text(
     context: Any,
     umo: str,
     text: str,
     at_user_ids: Sequence[str] = (),
     allow_at: bool = True,
+    at_all: bool = False,
 ) -> bool:
-    """向群聊会话发送文本，可选在文首真实 @ 若干人。
+    """向群聊会话发送文本，可选在文首 @全体成员 或 @ 若干人。
 
-    真实 @ 失败（平台不支持、被风控等）时自动退回纯文本，保证公告一定发得出去。
+    真实 @ 失败（平台不支持、机器人不是管理员、@全体成员 配额用尽、被风控等）
+    时自动退回纯文本，保证公告一定发得出去。
 
     Args:
         context: 插件 Context。
@@ -189,6 +253,7 @@ async def send_group_text(
         text: 正文。
         at_user_ids: 需要 @ 的用户 ID 列表。
         allow_at: 是否尝试真实 @。
+        at_all: 是否尝试 @全体成员（优先级高于 ``at_user_ids``）。
 
     Returns:
         是否发送成功。
@@ -197,6 +262,15 @@ async def send_group_text(
     if mc is None:
         logger.warning("[群抽奖] 消息组件不可用，跳过发送")
         return False
+
+    if at_all and platform_supports_at(context, umo):
+        chain = build_at_all_chain(text)
+        if chain:
+            try:
+                if await context.send_message(umo, _wrap(chain)) is not False:
+                    return True
+            except Exception as exc:
+                logger.warning(f"[群抽奖] @全体成员 发送失败，降级为普通公告：{exc}")
 
     if allow_at and at_user_ids and platform_supports_at(context, umo):
         chain = build_at_chain(at_user_ids, text)

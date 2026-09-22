@@ -19,24 +19,31 @@ from astrbot_plugin_group_lottery.main import GroupLotteryPlugin
 GROUP_UMO = "aiocqhttp:GroupMessage:888888"
 PLATFORM_ID = "aiocqhttp"
 GROUP_ID = "888888"
+BOT_ID = "9999"
 
 
 # --------------------------------------------------------------- 事件替身
 
 
 class _Bot:
-    """最小 OneBot 客户端替身（群列表 + 撤回）。"""
+    """最小 OneBot 客户端替身（群列表 + 撤回 + 机器人自身群身份）。"""
 
-    def __init__(self, groups=None) -> None:
+    def __init__(self, groups=None, role: str = "member") -> None:
         self.groups = (
             [{"group_id": int(GROUP_ID), "group_name": "测试群"}]
             if groups is None
             else groups
         )
+        self.role = role
         self.recalled: list = []
+        self.member_queries: list = []
 
     async def get_group_list(self):
         return self.groups
+
+    async def get_group_member_info(self, group_id=None, user_id=None, **_kwargs):
+        self.member_queries.append((group_id, user_id))
+        return {"role": self.role}
 
     async def delete_msg(self, message_id):
         self.recalled.append(message_id)
@@ -107,6 +114,10 @@ class FakeEvent:
 
     def get_sender_name(self) -> str:
         return self._sender.nickname
+
+    def get_self_id(self) -> str:
+        """机器人自己的账号（判断自身群身份时要用）。"""
+        return BOT_ID
 
     def get_group_id(self) -> str:
         return "" if self._private else self._group_id
@@ -216,17 +227,27 @@ def sent_texts(plugin: GroupLotteryPlugin, umo: str | None = None) -> list[str]:
     return out
 
 
-def admin_event(text: str, **kwargs) -> FakeEvent:
-    """构造群里的管理员事件。"""
+def admin_event(text: str, *, bot_role: str | None = None, **kwargs) -> FakeEvent:
+    """构造群里的管理员事件。
+
+    Args:
+        bot_role: 传入时给事件挂上 OneBot 客户端替身，并指定机器人在群里的身份
+            （``owner`` / ``admin`` / ``member``）。默认不挂，模拟「平台不支持」。
+    """
     kwargs.setdefault("is_admin", True)
-    return FakeEvent(text, **kwargs)
+    event = FakeEvent(text, **kwargs)
+    if bot_role is not None:
+        event.bot = _Bot(role=bot_role)
+    return event
 
 
-def private_admin_event(text: str, *, groups=None, **kwargs) -> FakeEvent:
+def private_admin_event(
+    text: str, *, groups=None, bot_role: str = "member", **kwargs
+) -> FakeEvent:
     """构造私聊里的全局管理员事件（带 OneBot 群列表能力）。"""
     kwargs.setdefault("is_admin", True)
     event = FakeEvent(text, private=True, **kwargs)
-    event.bot = _Bot(groups=groups)
+    event.bot = _Bot(groups=groups, role=bot_role)
     return event
 
 
@@ -959,7 +980,7 @@ def test_publish_from_private_announces_in_group(plugin: GroupLotteryPlugin):
     )
     assert "抽奖已发布" in out
     assert "群 888888（测试群）" in out
-    assert "已在该群播报抽奖信息" in out
+    assert "已在群里播报抽奖信息" in out
 
     raffle = plugin.db.get_open_raffle(GROUP_UMO)
     assert raffle is not None
@@ -975,10 +996,100 @@ def test_publish_from_private_announces_in_group(plugin: GroupLotteryPlugin):
     assert "抽奖 参与" in announcements[-1]
 
 
-def test_publish_from_group_does_not_double_announce(plugin: GroupLotteryPlugin):
-    """群里发布时，回复本身就在群里，不需要再额外播报。"""
+def test_publish_from_group_also_announces(plugin: GroupLotteryPlugin):
+    """群里发布时也要发独立公告 —— 回复是给管理员的（含密钥指引），不适合当成员公告。"""
     run(send(plugin, admin_event("抽奖 发布 月卡")))
-    assert sent_texts(plugin, GROUP_UMO) == []
+    announcements = sent_texts(plugin, GROUP_UMO)
+    assert len(announcements) == 1
+    assert "新抽奖开始啦" in announcements[0]
+    assert "抽奖 密钥" not in announcements[0], "公告里不该出现管理指引"
+
+
+# ------------------------------------------------- 发布后 @全体成员
+
+
+def test_publish_at_all_when_bot_is_admin(plugin: GroupLotteryPlugin):
+    """机器人是群管理员时，发布后主动 @全体成员。"""
+    event = admin_event("抽奖 发布 月卡", bot_role="admin")
+    out = texts_of(run(send(plugin, event)))
+    assert "已在群里播报并 @全体成员" in out
+    # 确实查询了「机器人自己」在该群的身份，而不是凭空 @
+    assert event.bot.member_queries == [(int(GROUP_ID), int(BOT_ID))]
+
+    announcements = sent_texts(plugin, GROUP_UMO)
+    assert len(announcements) == 1
+    assert announcements[0].startswith("<at:all>"), announcements[0]
+    assert "新抽奖开始啦" in announcements[0]
+
+
+def test_publish_at_all_when_bot_is_owner(plugin: GroupLotteryPlugin):
+    """群主身份同样可以 @全体成员。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡", bot_role="owner")))
+    assert sent_texts(plugin, GROUP_UMO)[0].startswith("<at:all>")
+
+
+def test_publish_without_at_all_when_bot_is_member(plugin: GroupLotteryPlugin):
+    """机器人只是普通成员时不能 @全体成员，降级为普通公告并说明原因。"""
+    out = texts_of(
+        run(send(plugin, admin_event("抽奖 发布 月卡", bot_role="member"))),
+    )
+    assert "已在群里播报抽奖信息" in out
+    assert "机器人不是群管理员，无法 @全体成员" in out
+
+    announcements = sent_texts(plugin, GROUP_UMO)
+    assert len(announcements) == 1
+    assert "<at:all>" not in announcements[0]
+    assert "新抽奖开始啦" in announcements[0]
+
+
+def test_publish_at_all_skipped_when_platform_unknown(plugin: GroupLotteryPlugin):
+    """拿不到群成员信息（非 OneBot / 无 bot 对象）时不 @全体成员。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡")))  # bot 为 None
+    announcements = sent_texts(plugin, GROUP_UMO)
+    assert "<at:all>" not in announcements[0]
+
+
+def test_publish_at_all_can_be_disabled(plugin: GroupLotteryPlugin):
+    """配置关闭后即使机器人是管理员也不 @全体成员。"""
+    plugin.config["at_all_on_publish"] = False
+    run(send(plugin, admin_event("抽奖 发布 月卡", bot_role="admin")))
+    announcements = sent_texts(plugin, GROUP_UMO)
+    assert len(announcements) == 1
+    assert "<at:all>" not in announcements[0]
+
+
+def test_publish_at_all_falls_back_on_failure(plugin: GroupLotteryPlugin):
+    """@全体成员 发送失败（如配额用尽）时，仍要把公告发出去。"""
+
+    class _FlakyContext:
+        """第一次（带 AtAll）失败，第二次（纯文本）成功。"""
+
+        def __init__(self, inner):
+            self.inner = inner
+            self.calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        async def send_message(self, session, chain):
+            self.calls += 1
+            if any(
+                getattr(c, "qq", None) == "all" for c in getattr(chain, "chain", [])
+            ):
+                raise RuntimeError("群成员 @全体成员 次数已达上限")
+            return await self.inner.send_message(session, chain)
+
+    real = plugin.context
+    plugin.context = _FlakyContext(real)
+    try:
+        run(send(plugin, admin_event("抽奖 发布 月卡", bot_role="admin")))
+    finally:
+        plugin.context = real
+
+    announcements = sent_texts(plugin, GROUP_UMO)
+    assert len(announcements) == 1, "降级后公告必须发出去"
+    assert "<at:all>" not in announcements[0]
+    assert "新抽奖开始啦" in announcements[0]
 
 
 def test_publish_from_private_requires_bot_in_group(plugin: GroupLotteryPlugin):

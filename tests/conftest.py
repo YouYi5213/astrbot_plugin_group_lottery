@@ -78,6 +78,18 @@ class At:
         return f"At({self.qq})"
 
 
+class AtAll:
+    """替代 ``message_components.AtAll``（OneBot 下序列化为 at/all）。"""
+
+    type = "at"
+
+    def __init__(self, **_kwargs) -> None:
+        self.qq = "all"
+
+    def __repr__(self) -> str:
+        return "AtAll()"
+
+
 class Image:
     """替代 ``message_components.Image``。"""
 
@@ -206,6 +218,7 @@ def _install() -> None:
     api_components = types.ModuleType("astrbot.api.message_components")
     api_components.Plain = Plain
     api_components.At = At
+    api_components.AtAll = AtAll
     api_components.Image = Image
 
     api_web = types.ModuleType("astrbot.api.web")

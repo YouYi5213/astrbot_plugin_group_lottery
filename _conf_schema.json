@@ -44,6 +44,12 @@
     "default": true,
     "hint": "部分平台（如 QQ 官方机器人）不支持真实 @，会自动降级为文本昵称。"
   },
+  "at_all_on_publish": {
+    "description": "发布抽奖后 @全体成员",
+    "type": "bool",
+    "default": true,
+    "hint": "仅当机器人自己是该群管理员/群主时才会 @全体成员（QQ 限制），否则发普通公告。@全体成员 每天有次数上限，发送失败会自动降级为普通公告。"
+  },
   "announce_template": {
     "description": "群内开奖公告模板",
     "type": "text",
