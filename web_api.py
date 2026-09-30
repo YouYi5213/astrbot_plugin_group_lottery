@@ -18,7 +18,7 @@ from astrbot.api.web import json_response, request
 from .core import texts
 from .core.engine import parse_keys
 from .core.models import KIND_KEY, STATUS_CANCELLED, STATUS_LABELS, TRIGGER_LABELS
-from .core.timeparse import format_ts
+from .core.timeparse import format_ts, humanize_interval
 
 
 def _ok(data: Any = None, message: str = "") -> Any:
@@ -43,6 +43,8 @@ def _decorate(raffle: dict[str, Any]) -> dict[str, Any]:
     item["drawn_at_str"] = format_ts(item.get("drawn_at"))
     # 面板展示用群内期号；raffle.id 仍是内部主键（接口按它取详情）
     item["seq"] = texts.raffle_no(item)
+    item["remind_label"] = humanize_interval(int(item.get("remind_interval") or 0))
+    item["next_remind_at_str"] = format_ts(item.get("next_remind_at"))
     return item
 
 

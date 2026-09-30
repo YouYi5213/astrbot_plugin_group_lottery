@@ -18,6 +18,7 @@ from typing import Any
 from astrbot.api import logger
 
 from .models import KIND_CONTACT, STATUS_OPEN
+from .timeparse import REMIND_BEFORE_SECONDS
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS raffles (
@@ -37,10 +38,15 @@ CREATE TABLE IF NOT EXISTS raffles (
     created_by     TEXT    NOT NULL DEFAULT '',
     drawn_at       INTEGER,
     draw_trigger   TEXT    NOT NULL DEFAULT '',
-    closed_note    TEXT    NOT NULL DEFAULT ''
+    closed_note    TEXT    NOT NULL DEFAULT '',
+    remind_interval    INTEGER NOT NULL DEFAULT 0,
+    next_remind_at     INTEGER,
+    remind_before_sent INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_raffles_umo    ON raffles(umo, status);
 CREATE INDEX IF NOT EXISTS idx_raffles_status ON raffles(status, draw_at);
+-- 提醒相关索引在 _migrate_add_reminder_columns 里建：老库此时还没有那些列，
+-- 放在这里会让整段 schema 脚本失败。
 
 CREATE TABLE IF NOT EXISTS participants (
     raffle_id INTEGER NOT NULL,
@@ -91,6 +97,9 @@ _UPDATABLE_RAFFLE_FIELDS = {
     "drawn_at",
     "draw_trigger",
     "closed_note",
+    "remind_interval",
+    "next_remind_at",
+    "remind_before_sent",
 }
 
 
@@ -136,6 +145,7 @@ class LotteryDB:
                 self._conn.execute(
                     "ALTER TABLE raffles ADD COLUMN seq INTEGER NOT NULL DEFAULT 0",
                 )
+            self._migrate_add_reminder_columns()
             pending = self._conn.execute(
                 "SELECT id, group_id FROM raffles WHERE seq IS NULL OR seq = 0 ORDER BY group_id, id",
             ).fetchall()
@@ -155,6 +165,20 @@ class LotteryDB:
                 )
         except Exception as exc:  # pragma: no cover - 迁移失败不应阻断启动
             logger.warning(f"[群抽奖] 群内期号迁移失败（可忽略）：{exc}")
+
+    def _migrate_add_reminder_columns(self) -> None:
+        """补上定时提醒相关列（老库升级用）。"""
+        existing = self._columns("raffles")
+        for name, ddl in (
+            ("remind_interval", "INTEGER NOT NULL DEFAULT 0"),
+            ("next_remind_at", "INTEGER"),
+            ("remind_before_sent", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE raffles ADD COLUMN {name} {ddl}")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_raffles_remind ON raffles(status, next_remind_at)",
+        )
 
     def _migrate_session_isolation(self) -> None:
         """把受 ``unique_session`` 污染的群标识修正回真实群号。
@@ -222,12 +246,21 @@ class LotteryDB:
         draw_at: int | None = None,
         min_players: int | None = None,
         created_by: str = "",
+        remind_interval: int = 0,
     ) -> int:
         """新建一场抽奖，返回场次 ID。
 
         ``id`` 是跨群全局自增的内部主键（用于关联参与者 / 密钥 / 中奖记录）；
         对用户展示的期号用 ``seq``，它按群独立从 1 开始。
+
+        Args:
+            remind_interval: 定期提醒间隔（秒），0 表示不提醒。首次提醒从
+                ``now + remind_interval`` 起算；若开奖时间已经很近
+                （``<= REMIND_BEFORE_SECONDS``），则跳过「开奖前」那次提醒，
+                避免刚发布就连着提醒两条。
         """
+        now = _now()
+        interval = max(0, int(remind_interval or 0))
         with self._lock:
             row = self._conn.execute(
                 "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM raffles WHERE group_id = ?",
@@ -238,8 +271,9 @@ class LotteryDB:
             """
             INSERT INTO raffles
                 (umo, group_id, seq, title, description, prize_kind, winner_count,
-                 draw_at, min_players, private_notify, status, created_at, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                 draw_at, min_players, private_notify, status, created_at, created_by,
+                 remind_interval, next_remind_at, remind_before_sent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
             """,
             (
                 umo,
@@ -252,8 +286,13 @@ class LotteryDB:
                 draw_at,
                 min_players,
                 STATUS_OPEN,
-                _now(),
+                now,
                 created_by,
+                interval,
+                (now + interval) if interval > 0 else None,
+                0
+                if (draw_at and int(draw_at) - now > REMIND_BEFORE_SECONDS)
+                else (1 if draw_at else 0),
             ),
         )
         return int(cur.lastrowid or 0)
@@ -314,6 +353,35 @@ class LotteryDB:
             "SELECT * FROM raffles WHERE status = ? AND draw_at IS NOT NULL AND draw_at <= ?"
             " ORDER BY draw_at ASC",
             (STATUS_OPEN, int(now if now is not None else _now())),
+        )
+
+    def list_due_reminders(self, now: int | None = None) -> list[dict[str, Any]]:
+        """列出该发提醒的抽奖。
+
+        命中任一条件即算到期：
+
+        1. 设了通知间隔，且 ``next_remind_at`` 已到；
+        2. 设了开奖时间，距开奖不足 ``REMIND_BEFORE_SECONDS``，且还没提醒过。
+        """
+        stamp = int(now if now is not None else _now())
+        return self._query(
+            """
+            SELECT * FROM raffles
+             WHERE status = ?
+               AND (
+                    (remind_interval > 0 AND next_remind_at IS NOT NULL AND next_remind_at <= ?)
+                 OR (remind_before_sent = 0 AND draw_at IS NOT NULL
+                     AND draw_at > ? AND draw_at - ? <= ?)
+               )
+             ORDER BY id ASC
+            """,
+            (
+                STATUS_OPEN,
+                stamp,
+                stamp,
+                stamp,
+                REMIND_BEFORE_SECONDS,
+            ),
         )
 
     def list_raffles(

@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -448,6 +448,9 @@ async function openDetail(id, seq) {
         <div class="k">形式</div><div>${raffle.prize_kind === "key" ? "私聊发密钥" : "联系群主领取"}</div>
         <div class="k">说明</div><div>${esc(raffle.description || "—")}</div>
         <div class="k">自动开奖</div><div>${esc(raffle.draw_at_str || "未设置（手动开奖）")}</div>
+        <div class="k">群内提醒</div><div>${esc(raffle.remind_label || "不通知")}${
+          raffle.next_remind_at_str ? ` <span class="hint">· 下一次 ${esc(raffle.next_remind_at_str)}</span>` : ""
+        }</div>
         <div class="k">满员开奖</div><div>${raffle.min_players ? Number(raffle.min_players) + " 人" : "未设置"}</div>
         <div class="k">触发方式</div><div>${esc(raffle.trigger_label || "—")}</div>
         <div class="k">创建 / 开奖</div><div class="hint">${esc(raffle.created_at_str)} / ${esc(raffle.drawn_at_str || "—")}</div>

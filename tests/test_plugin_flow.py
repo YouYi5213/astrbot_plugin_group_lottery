@@ -1467,6 +1467,22 @@ def test_web_api_overview_and_detail(plugin: GroupLotteryPlugin):
     assert groups["data"]["groups"][0]["group_id"] == "888888"
 
 
+def test_web_api_exposes_reminder_fields(plugin: GroupLotteryPlugin):
+    from astrbot_plugin_group_lottery.web_api import LotteryWebApi
+
+    run(send(plugin, admin_event("抽奖 发布 月卡 定时 +2h")))
+    api = LotteryWebApi(plugin)
+
+    raffle = run(api.raffle_detail(raffle_id="1"))["data"]["raffle"]
+    assert raffle["remind_label"] == "每 2 小时"
+    assert raffle["next_remind_at_str"]  # 面板要靠它显示「下一次」
+
+    run(send(plugin, admin_event("抽奖 通知 关")))
+    raffle = run(api.raffle_detail(raffle_id="1"))["data"]["raffle"]
+    assert raffle["remind_label"] == "不通知"
+    assert raffle["next_remind_at_str"] == ""
+
+
 def test_web_api_draw_and_cancel(plugin: GroupLotteryPlugin):
     from astrbot.api.web import request as request_stub
     from astrbot_plugin_group_lottery.web_api import LotteryWebApi
@@ -1529,3 +1545,180 @@ def test_web_api_registers_routes(plugin: GroupLotteryPlugin):
 def test_terminate_is_safe(plugin: GroupLotteryPlugin):
     run(plugin.terminate())
     assert plugin._terminating is True
+
+
+# --------------------------------------------------------------- 定时提醒
+
+
+def test_remind_command_sets_interval(plugin: GroupLotteryPlugin):
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    out = texts_of(run(send(plugin, admin_event("抽奖 通知 30m"))))
+    assert "每 30 分钟" in out
+    raffle = plugin.db.get_raffle(1)
+    assert raffle["remind_interval"] == 1800
+    assert raffle["next_remind_at"] == pytest.approx(int(time.time()) + 1800, abs=5)
+
+
+def test_remind_command_shows_current_setting(plugin: GroupLotteryPlugin):
+    run(send(plugin, admin_event("抽奖 发布 月卡 定时 +2h")))
+    out = texts_of(run(send(plugin, admin_event("抽奖 通知"))))
+    assert "当前提醒设置：每 2 小时" in out
+    assert "下一次提醒" in out
+    assert "开奖前 30 分钟会额外提醒一次" in out
+
+
+def test_remind_command_warns_when_no_draw_time(plugin: GroupLotteryPlugin):
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    out = texts_of(run(send(plugin, admin_event("抽奖 通知"))))
+    assert "还没设置开奖时间" in out
+
+
+def test_remind_command_off(plugin: GroupLotteryPlugin):
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    run(send(plugin, admin_event("抽奖 通知 2h")))
+    out = texts_of(run(send(plugin, admin_event("抽奖 通知 关"))))
+    assert "已关闭" in out
+    raffle = plugin.db.get_raffle(1)
+    assert raffle["remind_interval"] == 0
+    assert raffle["next_remind_at"] is None
+
+
+def test_remind_command_rejects_bad_interval(plugin: GroupLotteryPlugin):
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    out = texts_of(run(send(plugin, admin_event("抽奖 通知 每天"))))
+    assert "参数错误" in out
+    assert plugin.db.get_raffle(1)["remind_interval"] == 7200  # 仍是配置默认值
+
+
+def test_remind_command_from_private_by_group_id(plugin: GroupLotteryPlugin):
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    out = texts_of(run(send(plugin, private_admin_event(f"抽奖 通知 {GROUP_ID} 1天"))))
+    assert "每 1 天" in out
+    assert plugin.db.get_raffle(1)["remind_interval"] == 86400
+    # 私聊里省略群号仍应要求写明（「2h」会被当成群号）
+    bad = texts_of(run(send(plugin, private_admin_event("抽奖 通知 2h"))))
+    assert "群号必须是纯数字" in bad
+    assert plugin.db.get_raffle(1)["remind_interval"] == 86400  # 没被误改
+
+
+def test_remind_command_requires_open_raffle(plugin: GroupLotteryPlugin):
+    out = texts_of(run(send(plugin, admin_event("抽奖 通知 2h"))))
+    assert "没有进行中的抽奖" in out
+
+
+def test_publish_applies_default_remind_interval(plugin: GroupLotteryPlugin):
+    out = texts_of(run(send(plugin, admin_event("抽奖 发布 月卡 定时 +4h"))))
+    assert "每 2 小时提醒一次" in out
+    assert "开奖前 30 分钟会再提醒一次" in out
+    assert plugin.db.get_raffle(1)["remind_interval"] == 7200
+
+
+def test_publish_remind_interval_can_be_disabled_by_config(plugin: GroupLotteryPlugin):
+    plugin.config["remind_interval"] = "关"
+    out = texts_of(run(send(plugin, admin_event("抽奖 发布 月卡"))))
+    assert plugin.db.get_raffle(1)["remind_interval"] == 0
+    # 关闭后回复里改成提示如何开启
+    assert "抽奖 通知 2h" in out
+
+
+def test_publish_tolerates_bad_remind_interval_config(plugin: GroupLotteryPlugin):
+    plugin.config["remind_interval"] = "每两天"
+    out = texts_of(run(send(plugin, admin_event("抽奖 发布 月卡"))))
+    assert "抽奖已发布" in out
+    assert plugin.db.get_raffle(1)["remind_interval"] == 0
+
+
+def test_interval_reminder_is_sent_to_group(plugin: GroupLotteryPlugin):
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    plugin.db.update_raffle(1, next_remind_at=int(time.time()) - 1)
+
+    run(plugin._remind_due_raffles())
+
+    lines = sent_texts(plugin, GROUP_UMO)
+    assert "抽奖还在进行中" in lines[-1]
+    assert "已报名：1 人" in lines[-1]
+    # 提醒不该 @ 任何人，否则提醒本身就成了刷屏源
+    assert "<at:" not in lines[-1]
+    # 下一次提醒顺延
+    assert plugin.db.get_raffle(1)["next_remind_at"] > int(time.time())
+
+
+def test_interval_reminder_not_repeated_until_due(plugin: GroupLotteryPlugin):
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    plugin.db.update_raffle(1, next_remind_at=int(time.time()) - 1)
+    run(plugin._remind_due_raffles())
+    before = len(sent_texts(plugin, GROUP_UMO))
+    run(plugin._remind_due_raffles())
+    assert len(sent_texts(plugin, GROUP_UMO)) == before
+
+
+def test_before_draw_reminder_fires_once(plugin: GroupLotteryPlugin):
+    run(send(plugin, admin_event("抽奖 发布 月卡 定时 +2h")))
+    now = int(time.time())
+    # 把开奖时间挪到 10 分钟后（走 DB 是为了绕过「刚设置完不补提醒」的保护）
+    plugin.db.update_raffle(1, draw_at=now + 600)
+
+    run(plugin._remind_due_raffles())
+
+    lines = sent_texts(plugin, GROUP_UMO)
+    assert "就开奖了" in lines[-1]
+    assert "<at:" not in lines[-1]
+    assert plugin.db.get_raffle(1)["remind_before_sent"] == 1
+
+    # 再跑一轮不该重复
+    run(plugin._remind_due_raffles())
+    assert sum("就开奖了" in line for line in sent_texts(plugin, GROUP_UMO)) == 1
+
+
+def test_before_draw_reminder_skipped_when_interval_reminder_pending(
+    plugin: GroupLotteryPlugin,
+):
+    """已经进入开奖前窗口时，定期提醒让位给开奖前那条，不发两条。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 定时 +2h")))
+    now = int(time.time())
+    plugin.db.update_raffle(1, draw_at=now + 600, remind_before_sent=1)
+    plugin.db.update_raffle(1, next_remind_at=now - 1)
+
+    run(plugin._remind_due_raffles())
+
+    assert not any("抽奖还在进行中" in line for line in sent_texts(plugin, GROUP_UMO))
+
+
+def test_no_reminder_after_draw(plugin: GroupLotteryPlugin):
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    plugin.db.update_raffle(1, next_remind_at=int(time.time()) - 1)
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    before = len(sent_texts(plugin, GROUP_UMO))
+    run(plugin._remind_due_raffles())
+    assert len(sent_texts(plugin, GROUP_UMO)) == before
+
+
+def test_reminder_send_failure_does_not_retry_spam(plugin: GroupLotteryPlugin):
+    """发送失败也照样推进下一次时间，避免每个周期重试把群刷爆。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    plugin.db.update_raffle(1, next_remind_at=int(time.time()) - 1)
+    plugin.context.fail_group = True
+    try:
+        run(plugin._remind_due_raffles())
+    finally:
+        plugin.context.fail_group = False
+    assert plugin.db.get_raffle(1)["next_remind_at"] > int(time.time())
+
+
+def test_schedule_change_resets_reminder_plan(plugin: GroupLotteryPlugin):
+    """改了开奖时间后，提醒计划要重新排期，而不是沿用旧计划。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 定时 +5m")))
+    assert plugin.db.get_raffle(1)["remind_before_sent"] == 1  # 太近，不补提醒
+
+    run(send(plugin, admin_event("抽奖 定时 +3h")))
+    assert plugin.db.get_raffle(1)["remind_before_sent"] == 0
+
+    # 取消定时后不再有「开奖前」提醒，但定期提醒照旧从此刻重新起算
+    run(send(plugin, admin_event("抽奖 定时 关")))
+    raffle = plugin.db.get_raffle(1)
+    assert raffle["draw_at"] is None
+    assert raffle["remind_before_sent"] == 0
+    assert raffle["next_remind_at"] == pytest.approx(int(time.time()) + 7200, abs=5)

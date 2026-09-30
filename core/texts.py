@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from datetime import datetime
 from typing import Any
 
 from .models import KIND_KEY
-from .timeparse import format_ts, humanize_remaining
+from .timeparse import (
+    format_ts,
+    humanize_interval,
+    humanize_remaining,
+)
 
 
 def raffle_no(raffle: dict[str, Any] | None) -> int:
@@ -72,6 +77,11 @@ HELP_ROWS: list[tuple[str, str, str]] = [
         "管理员",
         "抽奖 定时 <时间>",
         "设置自动开奖时间，如 20:00 / +2h / 12-31 20:00；「抽奖 定时 关」取消",
+    ),
+    (
+        "管理员",
+        "抽奖 通知 [<间隔>|关]",
+        "每隔一段时间在群里提醒一次，如 2h / 30m / 1天 / 120；不带参数只看设置",
     ),
     ("管理员", "抽奖 满员 <人数>", "报名满 N 人立即开奖；「抽奖 满员 关」取消"),
     ("管理员", "抽奖 私聊 开|关", "密钥模式是否私聊中奖者发奖"),
@@ -213,6 +223,16 @@ def build_status(
     else:
         lines.append("自动开奖：未设置（由管理员手动开奖）")
 
+    interval = int(raffle.get("remind_interval") or 0)
+    if interval > 0:
+        next_at = format_ts(raffle.get("next_remind_at"))
+        lines.append(
+            f"群内提醒：{humanize_interval(interval)}一次"
+            + (f"（下一次 {next_at}）" if next_at else "")
+        )
+    else:
+        lines.append("群内提醒：未开启定期提醒")
+
     min_players = raffle.get("min_players")
     if min_players:
         lines.append(f"满员开奖：报名满 {min_players} 人立即开奖")
@@ -249,6 +269,59 @@ def build_records(
         lines.append(
             f"· [{when}] {raffle_label(row)}「{row.get('title', '')}」→ {name}{prize}"
         )
+    return "\n".join(lines)
+
+
+def build_reminder(
+    *,
+    raffle: dict[str, Any],
+    participant_count: int = 0,
+    kind: str = "interval",
+    now: int | None = None,
+) -> str:
+    """生成抽奖进行中的提醒文案。
+
+    这些提醒是**补充性**的（群聊刷屏后把公告顶掉了），语气比发布公告轻，
+    也不 @ 任何人。
+
+    Args:
+        raffle: 抽奖记录。
+        participant_count: 当前报名人数。
+        kind: ``interval`` 定期提醒 / ``before_draw`` 开奖前提醒。
+        now: 参考时间戳，默认取当前时间（测试可注入）。
+
+    Returns:
+        提醒文案。
+    """
+    label = raffle_label(raffle)
+    title = raffle.get("title", "")
+    head = f"{label}「{title}」"
+    moment = None if now is None else datetime.fromtimestamp(int(now))
+    remaining = humanize_remaining(raffle.get("draw_at"), moment)
+    if kind == "before_draw":
+        if remaining == "即将开奖":
+            lines = [f"⏰ {head} 马上就要开奖了"]
+        else:
+            lines = [f"⏰ {head} 还有 {remaining.removesuffix('后')}就开奖了"]
+    else:
+        lines = [f"📣 {head} 抽奖还在进行中"]
+
+    stat = f"已报名：{participant_count} 人 · 名额 {raffle.get('winner_count', 1)} 名"
+    lines.append(stat)
+    if raffle.get("draw_at"):
+        when = format_ts(raffle.get("draw_at"))
+        suffix = "" if kind == "before_draw" else f"（{remaining}）"
+        lines.append(f"开奖时间：{when}{suffix}")
+    else:
+        lines.append("开奖时间：由管理员手动开奖")
+    if raffle.get("description"):
+        lines.append(f"说明：{raffle['description']}")
+    lines.append("")
+    lines.append(
+        "还没参加的抓紧：发送「抽奖 参与」"
+        if kind == "before_draw"
+        else "参与方式：发送「抽奖 参与」"
+    )
     return "\n".join(lines)
 
 
@@ -336,9 +409,13 @@ def build_help(prefix: str = "/") -> str:
     )
     lines.append("[管理员] 抽奖 发布 <群号> <奖品名> [名额] —— 在指定群发布抽奖并播报")
     lines.append("[管理员] 抽奖 密钥 <群号> —— 下一行起粘贴密钥，一行一条")
-    lines.append("[管理员] 抽奖 状态|名单|开奖|取消|定时|满员|名额|说明|私聊 <群号>")
+    lines.append(
+        "[管理员] 抽奖 状态|名单|开奖|取消|定时|通知|满员|名额|说明|私聊 <群号>"
+    )
     lines.append("")
     lines.append("提示：密钥只能私聊机器人设置，群聊里发送会被拒绝并尝试撤回；")
     lines.append("开奖后机器人会把专属密钥私聊发给中奖者；")
     lines.append("如果没收到私聊，中奖者可在群里或私聊发送「抽奖 领取」补领。")
+    lines.append("抽奖期间可按「抽奖 通知」设置的间隔在群里重复提醒，")
+    lines.append("开奖前 30 分钟还会额外提醒一次，这些提醒都不 @全体成员。")
     return "\n".join(lines)

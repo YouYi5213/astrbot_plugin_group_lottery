@@ -19,6 +19,9 @@ DEFAULT_HOUR = 20
 DEFAULT_MINUTE = 0
 
 _RELATIVE_RE = re.compile(r"^\+\s*(\d+)\s*(s|m|h|d|秒|分|分钟|小时|天)$", re.IGNORECASE)
+_INTERVAL_RE = re.compile(
+    r"^\+?\s*(\d+)\s*(s|m|h|d|秒|分|分钟|小时|时|天)$", re.IGNORECASE
+)
 _CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 _MD_RE = re.compile(r"^(\d{1,2})-(\d{1,2})$")
 _YMD_RE = re.compile(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$")
@@ -31,12 +34,73 @@ _RELATIVE_UNITS = {
     "分钟": 60,
     "h": 3600,
     "小时": 3600,
+    "时": 3600,
     "d": 86400,
     "天": 86400,
 }
 
 # 允许的最长定时跨度，避免手滑写出十年后的开奖时间
 MAX_AHEAD_SECONDS = 365 * 86400
+
+# 通知间隔的上下限：太快会刷屏，太慢没有意义
+MIN_REMIND_INTERVAL = 60  # 1 分钟
+MAX_REMIND_INTERVAL = 7 * 86400  # 7 天
+
+# 开奖前多久补一次提醒
+REMIND_BEFORE_SECONDS = 1800  # 30 分钟
+
+
+def parse_interval(text: str) -> int:
+    """把「通知间隔」解析成秒数。
+
+    支持的写法（与开奖时间一致，但不要求 ``+`` 前缀）::
+
+        30m / 30分钟 / 2h / 2小时 / 1d / 1天 / 90s
+        120        —— 裸数字按「分钟」计，即 2 小时
+
+    Args:
+        text: 用户输入。
+
+    Returns:
+        间隔秒数，范围 ``[MIN_REMIND_INTERVAL, MAX_REMIND_INTERVAL]``。
+
+    Raises:
+        ValueError: 输入无法识别或超出范围。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("请提供通知间隔，例如：2h / 30m / 1天")
+
+    match = _INTERVAL_RE.match(raw)
+    if match:
+        seconds = int(match.group(1)) * _RELATIVE_UNITS[match.group(2).lower()]
+    elif raw.isdigit():
+        # 裸数字按分钟，符合「每 120 分钟通知一次」的直觉
+        seconds = int(raw) * 60
+    else:
+        raise ValueError(
+            f"无法识别的间隔：{raw}（示例：2h / 30m / 1天 / 120）",
+        )
+
+    if seconds < MIN_REMIND_INTERVAL:
+        raise ValueError(f"通知间隔不能短于 {MIN_REMIND_INTERVAL} 秒")
+    if seconds > MAX_REMIND_INTERVAL:
+        raise ValueError("通知间隔不能长于 7 天")
+    return seconds
+
+
+def humanize_interval(seconds: int) -> str:
+    """把间隔秒数描述成「每 2 小时」这类文本。"""
+    total = int(seconds or 0)
+    if total <= 0:
+        return "不通知"
+    if total % 86400 == 0:
+        return f"每 {total // 86400} 天"
+    if total % 3600 == 0:
+        return f"每 {total // 3600} 小时"
+    if total % 60 == 0:
+        return f"每 {total // 60} 分钟"
+    return f"每 {total} 秒"
 
 
 def _parse_clock(text: str) -> tuple[int, int]:

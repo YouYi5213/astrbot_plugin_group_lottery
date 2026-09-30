@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import random
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -20,9 +21,14 @@ from core.db import LotteryDB
 from core.engine import available_seats, draw, parse_keys
 from core.models import KIND_CONTACT, KIND_KEY, STATUS_DRAWN, STATUS_OPEN
 from core.timeparse import (
+    MAX_REMIND_INTERVAL,
+    MIN_REMIND_INTERVAL,
+    REMIND_BEFORE_SECONDS,
     format_ts,
+    humanize_interval,
     humanize_remaining,
     parse_draw_time,
+    parse_interval,
 )
 
 BASE = datetime(2026, 3, 10, 9, 30, 0)
@@ -86,6 +92,55 @@ def test_parse_rejects_garbage():
 def test_parse_rejects_too_far():
     with pytest.raises(ValueError, match="一年以内"):
         parse_draw_time("+400d", now=BASE)
+
+
+# ---------------------------------------------------------------- 提醒间隔
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("2h", 7200),
+        ("2H", 7200),
+        ("+2h", 7200),
+        ("30m", 1800),
+        ("30分钟", 1800),
+        ("1天", 86400),
+        ("1d", 86400),
+        ("90s", 90),
+        ("120", 7200),  # 裸数字按分钟
+        (" 2小时 ", 7200),
+    ],
+)
+def test_parse_interval(text, expected):
+    assert parse_interval(text) == expected
+
+
+def test_parse_interval_rejects_garbage_and_out_of_range():
+    with pytest.raises(ValueError):
+        parse_interval("")
+    with pytest.raises(ValueError):
+        parse_interval("每天")
+    with pytest.raises(ValueError, match="不能短于"):
+        parse_interval("10s")
+    with pytest.raises(ValueError, match="不能短于"):
+        parse_interval("0")
+    with pytest.raises(ValueError, match="不能长于"):
+        parse_interval("8d")
+    assert MIN_REMIND_INTERVAL == 60
+    assert MAX_REMIND_INTERVAL == 7 * 86400
+
+
+def test_humanize_interval():
+    assert humanize_interval(0) == "不通知"
+    assert humanize_interval(7200) == "每 2 小时"
+    assert humanize_interval(86400) == "每 1 天"
+    assert humanize_interval(1800) == "每 30 分钟"
+    assert humanize_interval(90) == "每 90 秒"
+
+
+def test_remind_before_window_is_30_minutes():
+    assert REMIND_BEFORE_SECONDS == 1800
 
 
 def test_format_and_humanize():
@@ -615,3 +670,181 @@ def test_parse_publish_rejects_bad_input():
         parse_publish("月卡 说明")
     with pytest.raises(PublishParseError):
         parse_publish("x" * 61)
+
+
+# ---------------------------------------------------------------- 定时提醒
+
+
+UMO = "aiocqhttp:GroupMessage:123"
+
+
+def test_create_raffle_sets_reminder_plan(db: LotteryDB):
+    rid = db.create_raffle(
+        umo=UMO,
+        group_id="123",
+        title="月卡",
+        draw_at=int(time.time()) + 6 * 3600,
+        remind_interval=7200,
+    )
+    raffle = db.get_raffle(rid)
+    assert raffle["remind_interval"] == 7200
+    # 第一次提醒从「现在 + 间隔」起算，而不是立刻
+    assert raffle["next_remind_at"] == raffle["created_at"] + 7200
+    # 开奖还在 6 小时后，开奖前那次提醒尚未消费
+    assert raffle["remind_before_sent"] == 0
+
+
+def test_create_raffle_without_interval_has_no_next_remind(db: LotteryDB):
+    rid = db.create_raffle(umo=UMO, group_id="123", title="月卡")
+    raffle = db.get_raffle(rid)
+    assert raffle["remind_interval"] == 0
+    assert raffle["next_remind_at"] is None
+    assert db.list_due_reminders(now=raffle["created_at"] + 10**6) == []
+
+
+def test_create_raffle_skips_pre_draw_reminder_when_draw_is_close(db: LotteryDB):
+    """刚发布就开奖（不足 30 分钟）时不要再补一条「马上开奖」。"""
+    now = int(time.time())
+    rid = db.create_raffle(umo=UMO, group_id="123", title="月卡", draw_at=now + 600)
+    assert db.get_raffle(rid)["remind_before_sent"] == 1
+    assert db.list_due_reminders(now=now + 1) == []
+
+
+def test_list_due_reminders_interval(db: LotteryDB):
+    now = int(time.time())
+    rid = db.create_raffle(umo=UMO, group_id="123", title="月卡", remind_interval=3600)
+    assert db.list_due_reminders(now=now + 3599) == []
+    due = db.list_due_reminders(now=now + 3600)
+    assert [int(r["id"]) for r in due] == [rid]
+
+
+def test_list_due_reminders_before_draw(db: LotteryDB):
+    now = int(time.time())
+    rid = db.create_raffle(
+        umo=UMO, group_id="123", title="月卡", draw_at=now + 6 * 3600
+    )
+    # 距开奖还有 6 小时：不该提醒
+    assert db.list_due_reminders(now=now + 1) == []
+    # 距开奖还有 29 分钟：到了开奖前窗口
+    assert [int(r["id"]) for r in db.list_due_reminders(now=now + 6 * 3600 - 1740)] == [
+        rid
+    ]
+    # 已经提醒过就不再重复
+    db.update_raffle(rid, remind_before_sent=1)
+    assert db.list_due_reminders(now=now + 6 * 3600 - 1740) == []
+
+
+def test_list_due_reminders_ignores_closed_and_far_raffles(db: LotteryDB):
+    now = int(time.time())
+    rid = db.create_raffle(
+        umo=UMO,
+        group_id="123",
+        title="月卡",
+        draw_at=now + 100,
+        remind_interval=3600,
+    )
+    # 距开奖只有 100 秒 → 建场时就标记了「开奖前提醒已消费」，且间隔还没到
+    assert db.list_due_reminders(now=now + 1) == []
+    db.update_raffle(rid, status=STATUS_DRAWN)
+    db.update_raffle(rid, next_remind_at=now - 1)
+    assert db.list_due_reminders(now=now) == []
+
+
+def test_reminder_columns_survive_legacy_database():
+    """老库（没有提醒列）升级后应该能补列并正常查询。"""
+    workdir = Path(__file__).resolve().parent / ".tmp"
+    workdir.mkdir(parents=True, exist_ok=True)
+    db_path = workdir / f"legacy_{random.getrandbits(32):08x}.db"
+    database = LotteryDB(db_path)
+    # 模拟老库：先删掉依赖这些列的索引，再把列删掉（SQLite 支持 DROP COLUMN）
+    database._conn.execute("DROP INDEX IF EXISTS idx_raffles_remind")
+    for column in ("remind_interval", "next_remind_at", "remind_before_sent"):
+        database._conn.execute(f"ALTER TABLE raffles DROP COLUMN {column}")
+    database._conn.commit()
+    database.close()
+
+    reopened = LotteryDB(db_path)
+    columns = reopened._columns("raffles")
+    assert {"remind_interval", "next_remind_at", "remind_before_sent"} <= set(columns)
+    assert reopened.list_due_reminders(now=int(time.time())) == []
+    reopened.close()
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            Path(str(db_path) + suffix).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _raffle_stub(**overrides):
+    base = {
+        "id": 1,
+        "seq": 3,
+        "title": "月卡",
+        "winner_count": 2,
+        "draw_at": None,
+        "description": "",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_build_reminder_interval():
+    now = 1_800_000_000
+    text = texts.build_reminder(
+        raffle=_raffle_stub(draw_at=now + 7200),
+        participant_count=5,
+        kind="interval",
+        now=now,
+    )
+    assert "第 3 期" in text
+    assert "月卡" in text
+    assert "已报名：5 人 · 名额 2 名" in text
+    assert "抽奖 参与" in text
+    assert "2 小时 0 分后" in text
+
+
+def test_build_reminder_before_draw():
+    now = 1_800_000_000
+    text = texts.build_reminder(
+        raffle=_raffle_stub(draw_at=now + 1500),
+        participant_count=5,
+        kind="before_draw",
+        now=now,
+    )
+    assert "就开奖了" in text
+    assert "还有 25 分钟就开奖了" in text
+    assert "抓紧" in text
+    # 开奖前那条不必再重复「还有多久开奖」的括号
+    assert "（25 分钟后）" not in text
+
+
+def test_build_reminder_before_draw_with_past_deadline():
+    """兜底：时间已经过了也不该拼出「还有 即将开奖就开奖了」这种病句。"""
+    now = 1_800_000_000
+    text = texts.build_reminder(
+        raffle=_raffle_stub(draw_at=now - 5),
+        participant_count=1,
+        kind="before_draw",
+        now=now,
+    )
+    assert "马上就要开奖了" in text
+    assert "即将开奖就" not in text
+
+
+def test_build_reminder_without_draw_time():
+    text = texts.build_reminder(raffle=_raffle_stub(), participant_count=0, now=0)
+    assert "由管理员手动开奖" in text
+    assert "已报名：0 人" in text
+
+
+def test_build_reminder_never_mentions_at_all_marker():
+    """提醒文案本身不含 @ 段（发送时也不带 At），这里只做文案侧的兜底。"""
+    now = 1_800_000_000
+    for kind in ("interval", "before_draw"):
+        text = texts.build_reminder(
+            raffle=_raffle_stub(draw_at=now + 600),
+            participant_count=1,
+            kind=kind,
+            now=now,
+        )
+        assert "@全体成员" not in text

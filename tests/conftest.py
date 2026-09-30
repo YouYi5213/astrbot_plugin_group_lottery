@@ -145,9 +145,13 @@ class Context:
         self.web_apis: list[tuple] = []
         # 测试可用：让私聊投递失败，模拟「未加好友 / 被风控」
         self.fail_private = False
+        # 测试可用：让群消息投递失败，模拟适配器没找到目标群
+        self.fail_group = False
 
     async def send_message(self, session, message_chain) -> bool:
         if self.fail_private and "FriendMessage" in str(session):
+            return False
+        if self.fail_group and "GroupMessage" in str(session):
             return False
         self.sent.append((str(session), message_chain))
         return True

@@ -50,7 +50,13 @@ from .core.notifier import (
     send_private_text,
     try_recall_message,
 )
-from .core.timeparse import parse_draw_time
+from .core.timeparse import (
+    REMIND_BEFORE_SECONDS,
+    format_ts,
+    humanize_interval,
+    parse_draw_time,
+    parse_interval,
+)
 from .web_api import LotteryWebApi
 
 PLUGIN_NAME = "astrbot_plugin_group_lottery"
@@ -97,6 +103,9 @@ _SUBCOMMANDS: dict[str, tuple[str, bool]] = {
     "private": ("private", True),
     "说明": ("describe", True),
     "desc": ("describe", True),
+    "通知": ("remind", True),
+    "提醒": ("remind", True),
+    "remind": ("remind", True),
     "开奖": ("draw_now", True),
     "draw": ("draw_now", True),
     "取消": ("cancel", True),
@@ -115,6 +124,7 @@ _PRIVATE_GROUP_SCOPED = {
     "full",
     "private",
     "describe",
+    "remind",
     "draw_now",
     "cancel",
 }
@@ -295,6 +305,37 @@ class GroupLotteryPlugin(Star):
     def _at_all_on_publish(self) -> bool:
         """发布抽奖后是否尝试 @全体成员（还需机器人本身是群管理员）。"""
         return bool(self._cfg("at_all_on_publish", True))
+
+    def _default_remind_interval(self) -> int:
+        """读取配置里的默认提醒间隔；配置写错时按「不提醒」处理，不让插件崩。"""
+        raw = str(self._cfg("remind_interval", "2h") or "").strip()
+        if not raw or raw.lower() in _OFF_WORDS:
+            return 0
+        try:
+            return parse_interval(raw)
+        except ValueError:
+            logger.warning(
+                f"[群抽奖] 配置项 remind_interval 无法识别：{raw}，已按不提醒处理"
+            )
+            return 0
+
+    def _set_draw_at(self, raffle_id: int, timestamp: int | None) -> None:
+        """设置开奖时间，并顺带重置提醒计划。
+
+        - 距开奖已不足 ``REMIND_BEFORE_SECONDS`` 时不再补发「开奖前」提醒
+          （刚发布或刚改完时间就提醒很吵）；
+        - 定期提醒的下一次时间从此刻重新起算。
+        """
+        now = int(time.time())
+        fields: dict[str, Any] = {"draw_at": timestamp}
+        if timestamp:
+            fields["remind_before_sent"] = (
+                0 if int(timestamp) - now > REMIND_BEFORE_SECONDS else 1
+            )
+        raffle = self.db.get_raffle(raffle_id) or {}
+        interval = int(raffle.get("remind_interval") or 0)
+        fields["next_remind_at"] = now + interval if interval > 0 else None
+        self.db.update_raffle(raffle_id, **fields)
 
     def _group_allowed(self, umo: str) -> bool:
         """群黑白名单判定。"""
@@ -816,6 +857,7 @@ class GroupLotteryPlugin(Star):
             draw_at=draw_at,
             min_players=spec.min_players,
             created_by=str(event.get_sender_id()),
+            remind_interval=self._default_remind_interval(),
         )
         if spec.private_notify is not None:
             self.db.update_raffle(
@@ -847,6 +889,13 @@ class GroupLotteryPlugin(Star):
         ]
         if draw_at_label:
             lines.append(f"开奖时间：{draw_at_label}")
+        remind_interval = int(raffle.get("remind_interval") or 0)
+        if remind_interval > 0:
+            when_next = format_ts(raffle.get("next_remind_at"))
+            note = f"提醒：{humanize_interval(remind_interval)}提醒一次"
+            lines.append(f"{note}（下一次 {when_next}）" if when_next else note)
+        if draw_at_label:
+            lines.append(f"提醒：开奖前 {REMIND_BEFORE_SECONDS // 60} 分钟会再提醒一次")
         if spec.min_players:
             lines.append(f"满员提前开奖：报名满 {spec.min_players} 人")
         if spec.description:
@@ -882,6 +931,12 @@ class GroupLotteryPlugin(Star):
                 f"· 抽奖 满员 {group_id} 10 —— 报名满 10 人提前开奖"
                 if from_private
                 else "· 抽奖 满员 10 —— 报名满 10 人提前开奖"
+            )
+        if remind_interval <= 0:
+            lines.append(
+                f"· 抽奖 通知 {group_id} 2h —— 每 2 小时在群里提醒一次"
+                if from_private
+                else "· 抽奖 通知 2h —— 每 2 小时在群里提醒一次（防止公告被刷掉）"
             )
         lines.append(
             f"· 抽奖 开奖 {group_id} —— 立即开奖"
@@ -1071,16 +1126,81 @@ class GroupLotteryPlugin(Star):
                 "· 抽奖 定时 关 —— 取消自动开奖" + suffix,
             )
         if body in _OFF_WORDS:
-            self.db.update_raffle(int(raffle["id"]), draw_at=None)
+            self._set_draw_at(int(raffle["id"]), None)
             yield event.plain_result(
                 f"✅ 已取消群 {group_id} 的定时自动开奖，改为手动开奖。"
             )
             return
 
         timestamp, readable = parse_draw_time(body)
-        self.db.update_raffle(int(raffle["id"]), draw_at=timestamp)
+        self._set_draw_at(int(raffle["id"]), timestamp)
         yield event.plain_result(
             f"⏰ 群 {group_id} 自动开奖时间已设为 {readable}，到点后机器人会自动开奖并公布名单。"
+            f"\n（开奖前 {REMIND_BEFORE_SECONDS // 60} 分钟会再提醒一次）"
+        )
+
+    async def _h_remind(
+        self, event: AstrMessageEvent, tail: str
+    ) -> AsyncGenerator[Any, None]:
+        """设置抽奖期间的定期提醒：抽奖 通知 [间隔|关]
+
+        写法与「抽奖 定时」一致，间隔用 2h / 30m / 1天 / 120（分钟）。
+        不带参数时只汇报当前设置。
+        """
+        umo, group_id, _name, body = await self._target(event, tail)
+        raffle = self._require_open_raffle(umo)
+        raffle_id = int(raffle["id"])
+        current = int(raffle.get("remind_interval") or 0)
+        suffix = (
+            f"（私聊写法：抽奖 通知 {group_id} <间隔>）"
+            if event.is_private_chat()
+            else ""
+        )
+
+        if not body:
+            next_at = raffle.get("next_remind_at")
+            lines = [
+                f"🔔 群 {group_id} 当前提醒设置：{humanize_interval(current)}",
+            ]
+            if current > 0 and next_at:
+                lines.append(f"下一次提醒：{format_ts(next_at)}")
+            if raffle.get("draw_at"):
+                lines.append(
+                    f"开奖前 {REMIND_BEFORE_SECONDS // 60} 分钟会额外提醒一次。"
+                )
+            else:
+                lines.append(
+                    "⚠️ 还没设置开奖时间，开奖前那次提醒不会触发（用「抽奖 定时」设置）。"
+                )
+            lines.append("")
+            lines.append(
+                "修改：抽奖 通知 2h / 抽奖 通知 30m / 抽奖 通知 关" + suffix,
+            )
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if body in _OFF_WORDS:
+            self.db.update_raffle(raffle_id, remind_interval=0, next_remind_at=None)
+            yield event.plain_result(
+                f"🔕 已关闭群 {group_id} 的定期提醒"
+                + (
+                    f"（开奖前 {REMIND_BEFORE_SECONDS // 60} 分钟仍会提醒一次）"
+                    if raffle.get("draw_at") and not raffle.get("remind_before_sent")
+                    else ""
+                )
+                + "。"
+            )
+            return
+
+        seconds = parse_interval(body)
+        self.db.update_raffle(
+            raffle_id,
+            remind_interval=seconds,
+            next_remind_at=int(time.time()) + seconds,
+        )
+        yield event.plain_result(
+            f"🔔 群 {group_id} 已设置{humanize_interval(seconds)}提醒一次"
+            f"（下一次 {format_ts(int(time.time()) + seconds)}）。"
         )
 
     async def _h_full(
@@ -1403,9 +1523,74 @@ class GroupLotteryPlugin(Star):
             except Exception as exc:
                 logger.error(f"[群抽奖] 自动开奖检查出错：{exc}", exc_info=True)
             try:
+                # 提醒放在开奖之后：已经开掉的场次不该再收到提醒
+                await self._remind_due_raffles()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error(f"[群抽奖] 提醒检查出错：{exc}", exc_info=True)
+            try:
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break
+
+    async def _remind_due_raffles(self) -> None:
+        """给到点的抽奖发一条群内提醒。
+
+        两类提醒共用一个入口：定期提醒（``remind_interval``）与开奖前
+        ``REMIND_BEFORE_SECONDS`` 那次。**都不 @ 任何人**，不然提醒本身就成了
+        刷屏源。
+
+        发送结果不确定时（平台没返回、投递失败）也照样推进下一次时间，避免
+        每分钟重试把群刷爆；失败只记日志。
+        """
+        now = int(time.time())
+        for raffle in self.db.list_due_reminders(now):
+            if self._terminating:
+                return
+            raffle_id = int(raffle["id"])
+            umo = str(raffle["umo"])
+            if not self._group_allowed(umo):
+                continue
+
+            draw_at = raffle.get("draw_at")
+            before_draw = bool(
+                draw_at
+                and not raffle.get("remind_before_sent")
+                and int(draw_at) > now
+                and int(draw_at) - now <= REMIND_BEFORE_SECONDS
+            )
+            kind = "before_draw" if before_draw else "interval"
+            interval = int(raffle.get("remind_interval") or 0)
+            if (
+                not before_draw
+                and draw_at
+                and int(draw_at) - now <= REMIND_BEFORE_SECONDS
+            ):
+                # 已经进入开奖前的窗口，这次提醒由 before_draw 那条负责，别发两条
+                continue
+
+            try:
+                participants = self.db.count_participants(raffle_id)
+                text = texts.build_reminder(
+                    raffle=raffle,
+                    participant_count=participants,
+                    kind=kind,
+                    now=now,
+                )
+                sent = await send_group_text(self.context, umo, text, allow_at=False)
+            except Exception as exc:
+                logger.warning(f"[群抽奖] 第 {raffle_id} 期提醒发送异常：{exc}")
+                sent = False
+            if not sent:
+                logger.warning(f"[群抽奖] 第 {raffle_id} 期提醒发送失败（{kind}）")
+
+            fields: dict[str, Any] = {
+                "next_remind_at": (now + interval) if interval > 0 else None,
+            }
+            if before_draw:
+                fields["remind_before_sent"] = 1
+            self.db.update_raffle(raffle_id, **fields)
 
     async def _draw_due_raffles(self) -> None:
         """把所有已到开奖时间的抽奖逐个开出。"""
