@@ -289,7 +289,7 @@ class GroupLotteryPlugin(Star):
         """群公告模板。"""
         return str(
             self._cfg("announce_template")
-            or "🎉 恭喜 <winners> 中奖！\n奖品：<prize>（共 <count> 名）\n请尽快联系 <contact> 领取奖励。",
+            or "🎉 恭喜 <winners> 中奖！\n奖品：<prize>（共 <count> 名）\n<how>",
         )
 
     def _private_template(self) -> str:
@@ -1488,6 +1488,7 @@ class GroupLotteryPlugin(Star):
             winners_display=display,
             drawn_at=drawn_at,
             notes=notes,
+            claim_private=deliver_privately,
         )
         await send_group_text(
             self.context,

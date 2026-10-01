@@ -117,6 +117,17 @@ def winners_text(winners: Sequence[dict[str, Any]], with_at: bool = False) -> st
     return "、".join(f"@{n}" if with_at else n for n in names)
 
 
+#: 开奖公告里「怎么领奖」那行，对应模板里的 ``<how>`` 占位符。
+ANNOUNCE_CTA = "请尽快联系 <contact> 领取奖励。"
+
+#: 密钥模式（机器人私聊发奖）下的领奖指引 —— 密钥已经私聊发出去了，
+#: 再让成员「联系群主领取」会把人引错方向。
+ANNOUNCE_CTA_PRIVATE = (
+    "请尽快查看机器人私聊领取奖励。\n"
+    "如果没收到私聊，请在群里发送「抽奖 领取」，或联系 <contact> 补发。"
+)
+
+
 def build_announce(
     *,
     raffle: dict[str, Any],
@@ -127,6 +138,7 @@ def build_announce(
     winners_display: str | None = None,
     drawn_at: int | None = None,
     notes: Iterable[str] = (),
+    claim_private: bool = False,
 ) -> str:
     """生成群内开奖公告。
 
@@ -139,6 +151,8 @@ def build_announce(
         winners_display: 中奖名单的展示文本；默认自动生成。
         drawn_at: 开奖时间戳。
         notes: 追加在公告末尾的补充说明（如密钥不足提醒）。
+        claim_private: 本场密钥是否已由机器人私聊发出；为真时把领奖指引换成
+            「查看私聊」，并兼容还没用上 ``<how>`` 的老模板。
 
     Returns:
         完整的公告文本。
@@ -147,21 +161,32 @@ def build_announce(
     if display is None:
         display = winners_text(winners)
 
-    body = fill(
-        template,
-        {
-            "winners": display,
-            "count": len(winners),
-            "prize": raffle.get("title", ""),
-            "group": group_id or raffle.get("group_id", ""),
-            "time": format_ts(drawn_at),
-            "contact": contact,
-            "raffle_id": raffle.get("id", ""),
-        },
-    ).strip()
+    values = {
+        "winners": display,
+        "count": len(winners),
+        "prize": raffle.get("title", ""),
+        "group": group_id or raffle.get("group_id", ""),
+        "time": format_ts(drawn_at),
+        "contact": contact,
+        "raffle_id": raffle.get("id", ""),
+    }
+    # <how> 的值里还嵌着 <contact>，所以要先把 <how> 展开，再做整轮占位符替换
+    cta = ANNOUNCE_CTA_PRIVATE if claim_private else ANNOUNCE_CTA
+    body = fill(fill(template, {"how": cta}), values).strip()
+
+    extra = [n for n in notes if n]
+    if claim_private and "<how>" not in (template or ""):
+        # v1.3.1 及更早的默认模板把领奖指引写死成「请尽快联系 <contact> 领取奖励。」，
+        # 而配置是落在用户那边的，改 schema 默认值救不了老安装。所以这里直接
+        # 把渲染后的那句话换成私聊版；模板被整个改写、找不到那句话时补一条说明。
+        private_cta = fill(ANNOUNCE_CTA_PRIVATE, values)
+        legacy_cta = fill(ANNOUNCE_CTA, values)
+        if legacy_cta and legacy_cta in body:
+            body = body.replace(legacy_cta, private_cta)
+        else:
+            extra.append(private_cta)
 
     lines = [f"🎊 开奖结果 ·「{raffle.get('title', '')}」", "", body]
-    extra = [n for n in notes if n]
     if extra:
         lines.append("")
         lines.extend(f"（{n}）" for n in extra)

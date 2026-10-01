@@ -59,8 +59,8 @@
   "announce_template": {
     "description": "群内开奖公告模板",
     "type": "text",
-    "default": "🎉 恭喜 <winners> 中奖！\n奖品：<prize>（共 <count> 名）\n请尽快联系 <contact> 领取奖励。",
-    "hint": "可用占位符：<winners> 中奖名单、<count> 中奖人数、<prize> 奖品名、<group> 群号、<time> 开奖时间、<contact> 联系方式、<raffle_id> 场次编号。"
+    "default": "🎉 恭喜 <winners> 中奖！\n奖品：<prize>（共 <count> 名）\n<how>",
+    "hint": "可用占位符：<winners> 中奖名单、<count> 中奖人数、<prize> 奖品名、<group> 群号、<time> 开奖时间、<contact> 联系方式、<raffle_id> 场次编号、<how> 领奖指引（普通奖品是「联系群主领取」，密钥奖品会自动换成「查看机器人私聊领取，没收到就在群里发「抽奖 领取」」）。"
   },
   "private_template": {
     "description": "私聊发奖模板",

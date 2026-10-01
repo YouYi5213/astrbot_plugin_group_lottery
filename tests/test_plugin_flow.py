@@ -957,6 +957,54 @@ def test_scheduled_draw_failure_clears_schedule(plugin: GroupLotteryPlugin):
     assert "定时开奖失败" in sent_texts(plugin, GROUP_UMO)[-1]
 
 
+def test_draw_announce_guides_winners_to_private_chat(plugin: GroupLotteryPlugin):
+    """密钥模式开奖后，公告要引导中奖者看私聊，而不是「联系群主领取」。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    set_keys(plugin, "KEY-AAA")
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    announce = sent_texts(plugin, GROUP_UMO)[-1]
+    assert "查看机器人私聊领取奖励" in announce
+    assert "抽奖 领取" in announce
+    assert "请尽快联系" not in announce
+
+
+def test_draw_announce_upgrades_legacy_template_in_private_mode(
+    plugin: GroupLotteryPlugin,
+):
+    """老安装的配置里存着写死「联系群主」的旧默认模板，也要被改成私聊指引。"""
+    plugin.config["announce_template"] = (
+        "🎉 恭喜 <winners> 中奖！\n"
+        "奖品：<prize>（共 <count> 名）\n"
+        "请尽快联系 <contact> 领取奖励。"
+    )
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    set_keys(plugin, "KEY-AAA")
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    announce = sent_texts(plugin, GROUP_UMO)[-1]
+    assert "查看机器人私聊领取奖励" in announce
+    assert "请尽快联系" not in announce
+    # <contact> 并没有被丢掉，还用在「找群主补发」上
+    assert "群主 QQ 12345" in announce
+
+
+def test_draw_announce_keeps_contact_hint_when_no_keys(plugin: GroupLotteryPlugin):
+    """普通奖品（没有私聊发密钥）仍提示联系群主领取。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    announce = sent_texts(plugin, GROUP_UMO)[-1]
+    assert "请尽快联系 群主 QQ 12345 领取奖励。" in announce
+    assert "查看机器人私聊" not in announce
+
+
 def test_key_mode_without_private_notify_keeps_key_pool(plugin: GroupLotteryPlugin):
     """prize_kind=key 但关闭了私聊发奖时，不应消耗密钥池。"""
     run(send(plugin, admin_event("抽奖 发布 月卡")))

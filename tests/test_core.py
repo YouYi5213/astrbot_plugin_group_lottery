@@ -471,6 +471,70 @@ def test_build_announce_supports_time_and_group_placeholders():
     assert "群 123 于 2026-03-10 09:30 开出 甲（第 7 期）" in text
 
 
+def test_announce_private_mode_replaces_legacy_cta():
+    """密钥模式：老模板里写死的「联系群主领取」要换成「查看私聊」。"""
+    text = texts.build_announce(
+        raffle={"id": 7, "title": "月卡"},
+        winners=[{"name": "甲", "user_id": "1"}],
+        template=(
+            "🎉 恭喜 <winners> 中奖！\n"
+            "奖品：<prize>（共 <count> 名）\n"
+            "请尽快联系 <contact> 领取奖励。"
+        ),
+        contact="群主",
+        claim_private=True,
+    )
+    assert "查看机器人私聊领取奖励" in text
+    assert "抽奖 领取" in text
+    assert "请尽快联系" not in text
+
+
+def test_announce_how_placeholder_follows_prize_mode():
+    """新模板里的 <how> 按奖品形态自动切换领奖指引。"""
+    raffle = {"id": 7, "title": "月卡"}
+    template = "恭喜 <winners> 中奖！\n<how>"
+    public = texts.build_announce(
+        raffle=raffle,
+        winners=[{"name": "甲"}],
+        template=template,
+        contact="群主",
+        claim_private=False,
+    )
+    private = texts.build_announce(
+        raffle=raffle,
+        winners=[{"name": "甲"}],
+        template=template,
+        contact="群主",
+        claim_private=True,
+    )
+    assert "请尽快联系 群主 领取奖励。" in public
+    assert "查看机器人私聊领取奖励" in private
+    assert "<how>" not in public
+    assert "<how>" not in private
+
+
+def test_announce_private_mode_appends_cta_to_custom_template():
+    """模板被完全改写、既没有 <how> 也没有旧默认那句时，补一条私聊指引。"""
+    raffle = {"id": 7, "title": "月卡"}
+    template = "中奖啦：<winners>（<prize>）"
+    private = texts.build_announce(
+        raffle=raffle,
+        winners=[{"name": "甲"}],
+        template=template,
+        contact="群主",
+        claim_private=True,
+    )
+    plain = texts.build_announce(
+        raffle=raffle,
+        winners=[{"name": "甲"}],
+        template=template,
+        contact="群主",
+        claim_private=False,
+    )
+    assert "查看机器人私聊领取奖励" in private
+    assert "查看机器人私聊" not in plain
+
+
 def test_build_private_uses_key():
     raffle = {"id": 7, "title": "月卡", "group_id": "123"}
     text = texts.build_private(
