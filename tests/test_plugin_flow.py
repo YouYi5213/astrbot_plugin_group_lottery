@@ -14,6 +14,7 @@ import pytest
 from astrbot.api import AstrBotConfig
 from astrbot.api.star import Context, StarTools
 from astrbot_plugin_group_lottery.core.db import LotteryDB
+from astrbot_plugin_group_lottery.core.notifier import resolve_bot
 from astrbot_plugin_group_lottery.main import GroupLotteryPlugin
 
 GROUP_UMO = "aiocqhttp:GroupMessage:888888"
@@ -26,9 +27,11 @@ BOT_ID = "9999"
 
 
 class _Bot:
-    """最小 OneBot 客户端替身（群列表 + 撤回 + 机器人自身群身份）。"""
+    """最小 OneBot 客户端替身（群列表 + 撤回 + 机器人自身群身份 + 私聊/临时会话）。"""
 
-    def __init__(self, groups=None, role: str = "member") -> None:
+    def __init__(
+        self, groups=None, role: str = "member", fail_private: bool = False
+    ) -> None:
         self.groups = (
             [{"group_id": int(GROUP_ID), "group_name": "测试群"}]
             if groups is None
@@ -37,6 +40,10 @@ class _Bot:
         self.role = role
         self.recalled: list = []
         self.member_queries: list = []
+        # 模拟「对方不是好友」：不带 group_id 的私聊会被协议端拒绝
+        self.fail_private = fail_private
+        # 记录 (group_id, user_id, 文本)，证明走了群临时会话
+        self.temp_sessions: list[tuple[int, int, str]] = []
 
     async def get_group_list(self):
         return self.groups
@@ -47,6 +54,45 @@ class _Bot:
 
     async def delete_msg(self, message_id):
         self.recalled.append(message_id)
+
+    async def send_private_msg(self, user_id=None, group_id=None, message=None, **_kw):
+        """OnBot ``send_private_msg``：带 ``group_id`` 时是群临时会话。"""
+        if self.fail_private:
+            raise RuntimeError("请先添加对方为好友")
+        self.temp_sessions.append((group_id, user_id, _flatten_message(message)))
+        return {"message_id": 1}
+
+
+def _flatten_message(message) -> str:
+    """把 OneBot 消息（字符串或数组段）拍平成纯文本。"""
+    if isinstance(message, str):
+        return message
+    parts = []
+    for seg in message or []:
+        if isinstance(seg, dict) and seg.get("type") == "text":
+            parts.append(str((seg.get("data") or {}).get("text", "")))
+    return "".join(parts)
+
+
+class _PlatformMeta:
+    """替代 ``PlatformMetadata``（只需要 name / id 两个字段）。"""
+
+    def __init__(self, name: str = "aiocqhttp", platform_id: str = PLATFORM_ID):
+        self.name = name
+        self.id = platform_id
+
+
+class _PlatformInst:
+    """适配器实例替身：``meta()`` + ``bot``，与 AiocqhttpAdapter 同形。"""
+
+    def __init__(
+        self, bot, name: str = "aiocqhttp", platform_id: str = PLATFORM_ID
+    ) -> None:
+        self.bot = bot
+        self._meta = _PlatformMeta(name, platform_id)
+
+    def meta(self) -> _PlatformMeta:
+        return self._meta
 
 
 class _Sender:
@@ -249,6 +295,22 @@ def private_admin_event(
     event = FakeEvent(text, private=True, **kwargs)
     event.bot = _Bot(groups=groups, role=bot_role)
     return event
+
+
+def install_platform_bot(
+    plugin: GroupLotteryPlugin,
+    *,
+    name: str = "aiocqhttp",
+    fail_private: bool = False,
+) -> _Bot:
+    """把 OneBot 客户端替身挂到 ``context.platform_manager`` 上。
+
+    定时开奖 / 面板开奖没有 ``event``，插件只能从平台管理器里取 ``bot``；
+    这里复刻那条路径。
+    """
+    bot = _Bot(fail_private=fail_private)
+    plugin.context.platform_manager.platform_insts = [_PlatformInst(bot, name=name)]
+    return bot
 
 
 # --------------------------------------------------------------- 发布 / 报名
@@ -1722,3 +1784,138 @@ def test_schedule_change_resets_reminder_plan(plugin: GroupLotteryPlugin):
     assert raffle["draw_at"] is None
     assert raffle["remind_before_sent"] == 0
     assert raffle["next_remind_at"] == pytest.approx(int(time.time()) + 7200, abs=5)
+
+
+# ------------------------------------------- 非好友也能收到私聊（群临时会话）
+
+
+def test_resolve_bot_finds_onebot_client_by_platform_id(plugin: GroupLotteryPlugin):
+    """无 event 时从平台管理器里按平台 ID 找到 OneBot 客户端。"""
+    assert resolve_bot(plugin.context, "") is None
+    assert resolve_bot(plugin.context, PLATFORM_ID) is None  # 还没注册任何适配器
+
+    bot = install_platform_bot(plugin)
+    assert resolve_bot(plugin.context, PLATFORM_ID) is bot
+    assert resolve_bot(plugin.context, "other_platform") is None
+
+    # 平台 ID 对得上但不是 OneBot 系，不能把 bot 交出去
+    install_platform_bot(plugin, name="qq_official")
+    assert resolve_bot(plugin.context, PLATFORM_ID) is None
+
+
+def test_key_dm_uses_group_temp_session_when_not_friend(plugin: GroupLotteryPlugin):
+    """中奖者不是好友时，改走「群临时会话」把密钥送达。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    set_keys(plugin, "SECRET-9")
+    bot = install_platform_bot(plugin)
+    plugin.context.fail_private = True  # 非好友：通用私聊会话一律发不出去
+
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    assert len(bot.temp_sessions) == 1
+    group_id, user_id, body = bot.temp_sessions[0]
+    assert (group_id, user_id) == (int(GROUP_ID), 1001)
+    assert "SECRET-9" in body
+    assert plugin.db.list_winners(user_id="1001")[0]["notified"] == 1
+
+    # 群里依然不出现密钥明文，也不再提示「没能收到私聊」
+    announce = sent_texts(plugin, GROUP_UMO)[-1]
+    assert "SECRET-9" not in announce
+    assert "没能收到私聊" not in announce
+
+
+def test_key_dm_falls_back_to_plain_private_when_temp_session_fails(
+    plugin: GroupLotteryPlugin,
+):
+    """协议端拒绝临时会话时退回通用私聊，不能因此丢密钥。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    set_keys(plugin, "SECRET-8")
+    bot = install_platform_bot(plugin, fail_private=True)  # send_private_msg 抛错
+
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    assert bot.temp_sessions == []
+    assert "SECRET-8" in "\n".join(sent_texts(plugin, "aiocqhttp:FriendMessage:1001"))
+    assert plugin.db.list_winners(user_id="1001")[0]["notified"] == 1
+
+
+def test_temp_session_skipped_for_non_onebot_platform(plugin: GroupLotteryPlugin):
+    """qq_official 之类的平台不认 group_id，不能误用临时会话接口。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    set_keys(plugin, "SECRET-7")
+    bot = install_platform_bot(plugin, name="qq_official")
+    plugin.context.fail_private = True
+
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    assert bot.temp_sessions == []
+    assert plugin.db.list_winners(user_id="1001")[0]["notified"] == 0
+    # 发不出去时，公告要给出「在本群发『抽奖 领取』」的自助办法
+    announce = sent_texts(plugin, GROUP_UMO)[-1]
+    assert "没能收到私聊" in announce
+    assert "抽奖 领取" in announce
+    assert "SECRET-7" not in announce
+
+
+def test_claim_in_group_uses_temp_session(plugin: GroupLotteryPlugin):
+    """中奖者在群里发「抽奖 领取」时，也要带上本群号重新发起临时会话。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡")))
+    set_keys(plugin, "SECRET-6")
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    run(send(plugin, admin_event("抽奖 开奖")))
+    plugin.db._exec("UPDATE winners SET notified = 0")
+    plugin.context.sent.clear()
+
+    bot = install_platform_bot(plugin)
+    plugin.context.fail_private = True
+    out = texts_of(run(send(plugin, FakeEvent("抽奖 领取", user_id="1001"))))
+
+    assert "已私聊发送你的密钥" in out
+    assert len(bot.temp_sessions) == 1
+    group_id, user_id, body = bot.temp_sessions[0]
+    assert (group_id, user_id) == (int(GROUP_ID), 1001)
+    assert "SECRET-6" in body
+
+
+def test_remaining_keys_dm_uses_temp_session(plugin: GroupLotteryPlugin):
+    """管理员在群里查剩余密钥时同样走临时会话，免得没加好友就收不到。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 3")))
+    set_keys(plugin, "K-1\nK-2\nK-3")
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    # 开奖之后才挂 bot，这样只观察「查看」这一步的投递
+    bot = install_platform_bot(plugin)
+    plugin.context.fail_private = True
+    out = texts_of(run(send(plugin, admin_event("抽奖 密钥 查看"))))
+
+    assert "已私聊发送" in out
+    assert len(bot.temp_sessions) == 1
+    group_id, user_id, body = bot.temp_sessions[0]
+    assert (group_id, user_id) == (int(GROUP_ID), 1001)
+    assert "K-2" in body and "K-3" in body
+
+
+def test_leftover_keys_dm_uses_temp_session(plugin: GroupLotteryPlugin):
+    """开奖后剩余密钥的私聊提醒同样走临时会话。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 3")))
+    set_keys(plugin, "L-1\nL-2\nL-3")
+    bot = install_platform_bot(plugin)
+    plugin.context.fail_private = True
+
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    # 第一条是中奖密钥，第二条是剩余密钥提醒，都发给 1001
+    assert len(bot.temp_sessions) == 2
+    assert all(call[:2] == (int(GROUP_ID), 1001) for call in bot.temp_sessions)
+    leftover_body = next(b for _g, _u, b in bot.temp_sessions if "还有" in b)
+    assert "还有 2 条密钥没有送出" in leftover_body
+    assert "L-2" in leftover_body and "L-3" in leftover_body
+    # 群里只报条数，不给明文
+    announce = sent_texts(plugin, GROUP_UMO)[-1]
+    assert "另有 2 条密钥未送出" in announce
+    assert "L-2" not in announce

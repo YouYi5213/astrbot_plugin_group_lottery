@@ -46,6 +46,7 @@ from .core.notifier import (
     group_umo,
     platform_of,
     platform_supports_at,
+    resolve_bot,
     send_group_text,
     send_private_text,
     try_recall_message,
@@ -781,7 +782,14 @@ class GroupLotteryPlugin(Star):
             if event.is_private_chat():
                 yield event.plain_result(text)
                 delivered.append(int(row["id"]))
-            elif await send_private_text(self.context, platform_id, uid, text):
+            elif await send_private_text(
+                self.context,
+                platform_id,
+                uid,
+                text,
+                bot=getattr(event, "bot", None),
+                group_id=str(row.get("group_id", "")),
+            ):
                 delivered.append(int(row["id"]))
             else:
                 failed += 1
@@ -792,7 +800,8 @@ class GroupLotteryPlugin(Star):
             return
         if failed:
             yield event.plain_result(
-                "⚠️ 私聊发送失败，请先添加机器人为好友，然后私聊发送「抽奖 领取」。",
+                "⚠️ 私聊发送失败：机器人还没能联系上你。请先添加机器人为好友，"
+                "再在本群发一次「抽奖 领取」。",
             )
         else:
             yield event.plain_result("✅ 已私聊发送你的密钥，请查收。")
@@ -1078,11 +1087,13 @@ class GroupLotteryPlugin(Star):
             event.get_platform_id(),
             str(event.get_sender_id()),
             "\n".join(lines),
+            bot=getattr(event, "bot", None),
+            group_id=group_id,
         )
         yield event.plain_result(
             "✅ 剩余密钥已私聊发送，请查收。"
             if sent
-            else "⚠️ 私聊发送失败，请先添加机器人为好友后重试。",
+            else "⚠️ 私聊发送失败：请先添加机器人为好友，然后重试。",
         )
 
     async def _h_seats(
@@ -1376,6 +1387,8 @@ class GroupLotteryPlugin(Star):
         platform_id = platform_of(umo)
 
         # 先私聊发奖，再发群公告 —— 这样公告里能准确提示谁需要自助补领
+        # 带上群号走「群临时会话」，没加机器人为好友的中奖者也能收到密钥
+        bot_inst = resolve_bot(self.context, platform_id)
         failed_dm: list[str] = []
         winner_rows: list[dict[str, Any]] = []
         for winner in outcome.winners:
@@ -1394,6 +1407,8 @@ class GroupLotteryPlugin(Star):
                     platform_id,
                     winner["user_id"],
                     text,
+                    bot=bot_inst,
+                    group_id=group_id,
                 )
                 if not delivered:
                     failed_dm.append(str(winner.get("name") or winner["user_id"]))
@@ -1439,6 +1454,8 @@ class GroupLotteryPlugin(Star):
                     platform_id,
                     creator,
                     texts.build_leftover_keys(raffle, leftover, group_id, reason),
+                    bot=bot_inst,
+                    group_id=group_id,
                 )
 
         # 组装公告
@@ -1456,7 +1473,7 @@ class GroupLotteryPlugin(Star):
             )
         if failed_dm:
             notes.append(
-                "以下中奖者私聊发送失败，请主动私聊机器人发送「抽奖 领取」补领密钥："
+                "以下中奖者没能收到私聊，请在本群发送「抽奖 领取」补领密钥："
                 + "、".join(failed_dm),
             )
 

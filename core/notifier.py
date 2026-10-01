@@ -4,8 +4,8 @@
 
 1. **会话标识解析**：从 ``unified_msg_origin`` 里取出平台 ID / 群号 / 用户 ID；
 2. **真实 @ 的能力探测**：OneBot 系（aiocqhttp）支持真实 At，其它平台降级为文本；
-3. **私聊主动发送**：用 ``{platform_id}:FriendMessage:{user_id}`` 拼出私聊会话，
-   交给 ``context.send_message`` 投递，失败时返回 False 由上层兜底。
+3. **私聊主动发送**：先走 ``{platform_id}:FriendMessage:{user_id}`` 这个通用私聊
+   会话；发不出去时（对方不是好友）再用 OneBot 的「群临时会话」兜底重试。
 """
 
 from __future__ import annotations
@@ -292,39 +292,113 @@ async def send_group_text(
     return True
 
 
+def resolve_bot(context: Any, platform_id: str) -> Any | None:
+    """按平台 ID 找到底层 OneBot 客户端实例。
+
+    定时开奖与面板触发开奖时手边没有 ``event``，也就拿不到 ``event.bot``；
+    这里改从 ``context.platform_manager.platform_insts`` 里按平台 ID 找适配器，
+    取出它内部的 ``CQHttp`` 实例（``AiocqhttpAdapter.bot``）。
+
+    Args:
+        context: 插件 Context。
+        platform_id: 平台适配器 ID（``event.get_platform_id()``）。
+
+    Returns:
+        aiocqhttp 的 ``CQHttp`` 实例；找不到、平台不是 aiocqhttp 或适配器没暴露
+        ``bot`` 时返回 ``None``（调用方据此退回通用私聊会话）。
+    """
+    if not platform_id:
+        return None
+    try:
+        manager = getattr(context, "platform_manager", None)
+        insts = list(getattr(manager, "platform_insts", None) or []) if manager else []
+    except Exception:
+        return None
+    for inst in insts:
+        try:
+            meta = inst.meta()
+        except Exception:
+            continue
+        if getattr(meta, "id", None) != platform_id:
+            continue
+        # 只有 OneBot 系适配器才认 send_private_msg 的 group_id 参数
+        if getattr(meta, "name", "") != "aiocqhttp":
+            return None
+        return getattr(inst, "bot", None)
+    return None
+
+
 async def send_private_text(
-    context: Any, platform_id: str, user_id: str, text: str
+    context: Any,
+    platform_id: str,
+    user_id: str,
+    text: str,
+    *,
+    bot: Any = None,
+    group_id: str = "",
 ) -> bool:
     """向指定用户私聊发送文本。
+
+    **非好友也能送达**：QQ 里机器人给非好友发私聊会直接被拒，但 OneBot 协议端
+    （NapCat 等）支持「群临时会话」—— ``send_private_msg`` 带上 ``group_id``
+    时，协议端先看对方是不是好友（是则走 C2C），不是好友就用该群发起临时会话。
+
+    因此这里**先走通用私聊会话**（和以前完全一致，好友路径不受影响、也不绕过
+    AstrBot 的消息管道），只有它发不出去时才用群临时会话兜底重试。
 
     Args:
         context: 插件 Context。
         platform_id: 平台适配器 ID。
         user_id: 用户 ID。
         text: 正文。
+        bot: OneBot 客户端实例；留空且给了 ``group_id`` 时自动按平台 ID 查找。
+        group_id: 用户所在的群号，用于发起群临时会话。
 
     Returns:
         是否投递成功。判定依据有两条：
 
         1. ``context.send_message`` 返回 False —— 没找到匹配的平台适配器；
-        2. 抛异常 —— aiocqhttp 下「未加好友 / 被风控」会让
-           ``bot.send_private_msg`` 抛 ``ActionFailed``，适配器不做捕获。
+        2. 抛异常 —— aiocqhttp 下「未加好友」会让 ``bot.send_private_msg`` 抛
+           ``ActionFailed``，而适配器不做捕获。
 
         注意 ``Context.send_message`` 的返回值语义是「**是否找到平台**」而非
-        「是否送达」，适配器若自行吞掉错误，这里就感知不到。
+        「是否送达」；适配器若自行吞掉错误，两条通道都会误判成功。
     """
     mc = _components()
     if mc is None or not platform_id or not user_id:
         return False
+
     umo = private_umo(platform_id, user_id)
     try:
         sent = await context.send_message(umo, _wrap([mc.Plain(text)]))
     except Exception as exc:
-        logger.warning(f"[群抽奖] 私聊发送失败（{umo}）：{exc}")
+        logger.debug(f"[群抽奖] 通用私聊失败（{umo}）：{exc} —— 改用群临时会话重试")
+        sent = False
+    if sent is not False:
+        return True
+    if not group_id:
+        logger.warning(f"[群抽奖] 私聊发送失败（{umo}）")
         return False
-    if sent is False:
-        logger.warning(f"[群抽奖] 私聊发送失败：找不到平台适配器 {platform_id}")
+
+    # 多半是「对方不是好友」：带上群号发起群临时会话
+    if bot is None:
+        bot = resolve_bot(context, platform_id)
+    if bot is None or not str(group_id).isdigit() or not str(user_id).isdigit():
+        logger.warning(f"[群抽奖] 私聊发送失败（{umo}），且无法发起群临时会话")
         return False
+    try:
+        # 消息用 OneBot 的数组段格式，避免正文被当成 CQ 码二次解析
+        await bot.send_private_msg(
+            user_id=int(user_id),
+            group_id=int(group_id),
+            message=[{"type": "text", "data": {"text": text}}],
+        )
+    except Exception as exc:
+        logger.warning(
+            f"[群抽奖] 群临时会话发送失败（群 {group_id} → {user_id}）：{exc}"
+        )
+        return False
+    logger.info(f"[群抽奖] 已通过群 {group_id} 的临时会话把消息发给 {user_id}")
     return True
 
 
