@@ -19,13 +19,14 @@ import contextlib
 import re
 import time
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
-from .core import texts
+from .core import poster, texts
 from .core.args import PublishParseError, parse_publish
 from .core.db import LotteryDB
 from .core.engine import available_seats, draw, parse_keys
@@ -107,6 +108,10 @@ _SUBCOMMANDS: dict[str, tuple[str, bool]] = {
     "通知": ("remind", True),
     "提醒": ("remind", True),
     "remind": ("remind", True),
+    "海报": ("poster", True),
+    "配图": ("poster", True),
+    "图片": ("poster", True),
+    "poster": ("poster", True),
     "开奖": ("draw_now", True),
     "draw": ("draw_now", True),
     "取消": ("cancel", True),
@@ -126,6 +131,7 @@ _PRIVATE_GROUP_SCOPED = {
     "private",
     "describe",
     "remind",
+    "poster",
     "draw_now",
     "cancel",
 }
@@ -337,6 +343,27 @@ class GroupLotteryPlugin(Star):
         interval = int(raffle.get("remind_interval") or 0)
         fields["next_remind_at"] = now + interval if interval > 0 else None
         self.db.update_raffle(raffle_id, **fields)
+
+    def _poster_images(self, raffle: dict[str, Any] | None) -> list[Path]:
+        """取本场奖品配图的本地路径；没配图或文件已丢失时返回空列表。"""
+        found = poster.resolve_path(
+            self.data_dir, str((raffle or {}).get("poster") or "")
+        )
+        return [found] if found else []
+
+    def _sweep_posters(self) -> None:
+        """删掉已经不再被任何场次引用的配图文件。
+
+        历史裁剪、手动清空、发送中途失败都会留下孤儿图片，每次改图或发布时顺手
+        扫一遍，就不用额外维护清理逻辑了。
+        """
+        try:
+            removed = poster.sweep(self.data_dir, self.db.list_poster_keys())
+        except Exception as exc:
+            logger.debug(f"[群抽奖] 配图清理跳过：{exc}")
+            return
+        if removed:
+            logger.info(f"[群抽奖] 清理了 {removed} 个不再使用的配图")
 
     def _group_allowed(self, umo: str) -> bool:
         """群黑白名单判定。"""
@@ -874,6 +901,20 @@ class GroupLotteryPlugin(Star):
                 private_notify=1 if spec.private_notify else 0,
                 prize_kind=KIND_KEY if spec.private_notify else KIND_CONTACT,
             )
+
+        # 发布时回复了一张图，就把它当作本场的奖品配图（存不下来不影响发布）
+        poster_error = ""
+        try:
+            stored = await poster.store_from_event(
+                event,
+                self.data_dir,
+                group_id,
+                int((self.db.get_raffle(raffle_id) or {}).get("seq") or 0),
+            )
+        except Exception as exc:
+            stored, poster_error = None, str(exc)
+        if stored:
+            self.db.update_raffle(raffle_id, poster=stored)
         raffle = self.db.get_raffle(raffle_id) or {}
 
         # 在群里播报一条抽奖信息。私聊发布时群里看不到命令痕迹，群聊发布时
@@ -888,6 +929,7 @@ class GroupLotteryPlugin(Star):
             texts.build_publish_notice(raffle, group_id, group_name),
             allow_at=False,
             at_all=at_all,
+            images=self._poster_images(raffle),
         )
 
         where = f"群 {group_id}" + (f"（{group_name}）" if group_name else "")
@@ -909,6 +951,10 @@ class GroupLotteryPlugin(Star):
             lines.append(f"满员提前开奖：报名满 {spec.min_players} 人")
         if spec.description:
             lines.append(f"说明：{spec.description}")
+        if stored:
+            lines.append("🖼️ 奖品配图已随公告一起发出。")
+        elif poster_error:
+            lines.append(f"⚠️ 配图没保存成功：{poster_error}")
         if announced:
             lines.append(
                 "✅ 已在群里播报并 @全体成员。"
@@ -952,6 +998,12 @@ class GroupLotteryPlugin(Star):
             if from_private
             else "· 抽奖 开奖 —— 立即开奖"
         )
+        if not stored:
+            lines.append(
+                f"· 抽奖 海报 {group_id} —— 回复一张奖品截图后发送，给公告配图"
+                if from_private
+                else "· 回复一张奖品截图后发送「抽奖 海报」—— 给公告和提醒配图"
+            )
         yield event.plain_result("\n".join(lines))
 
     async def _h_keys(
@@ -1212,6 +1264,83 @@ class GroupLotteryPlugin(Star):
         yield event.plain_result(
             f"🔔 群 {group_id} 已设置{humanize_interval(seconds)}提醒一次"
             f"（下一次 {format_ts(int(time.time()) + seconds)}）。"
+        )
+
+    async def _h_poster(
+        self, event: AstrMessageEvent, tail: str
+    ) -> AsyncGenerator[Any, None]:
+        """奖品配图：抽奖 海报 [<群号>] [<图片链接>]
+
+        三种取图方式，任选其一：
+
+        * **回复**一张图片后再发本命令（群里、私聊都行）；
+        * 把图片和命令写在同一条消息里；
+        * 在命令后面直接写图片链接，由 AstrBot 去下载。
+
+        图片统一压到最长边 1280 后存进插件数据目录，之后**发布公告**与**群内
+        定时提醒**都会带上它。发送时不依赖协议端读本地文件——aiocqhttp 适配器
+        会把图片转成 base64 发出去。
+        """
+        from_private = event.is_private_chat()
+        # 先偷看一眼：只有「查看 / 清空」这类不含图片的输入才允许省略群号
+        peek_head, peek_body = _take_group_id(tail) if from_private else ("", "")
+        read_like = (
+            peek_body in _KEY_VIEW_WORDS
+            or peek_body in _KEY_CLEAR_WORDS
+            or peek_head in _KEY_VIEW_WORDS
+            or peek_head in _KEY_CLEAR_WORDS
+        )
+        umo, group_id, _name, body = await self._target(
+            event, tail, allow_default=read_like
+        )
+        raffle = self._require_open_raffle(umo)
+        raffle_id = int(raffle["id"])
+        seq = texts.raffle_no(raffle)
+        suffix = f"（私聊写法：抽奖 海报 {group_id}）" if from_private else ""
+
+        if body in _KEY_CLEAR_WORDS:
+            removed = poster.delete_poster(self.data_dir, group_id, seq)
+            self.db.update_raffle(raffle_id, poster="")
+            yield event.plain_result(
+                f"🗑️ 已清除{texts.raffle_label(raffle)}的奖品配图"
+                + ("。" if removed else "（本来就没有）。")
+            )
+            return
+
+        component = poster.extract_image(event)
+        url = poster.parse_url(body)
+        if body in _KEY_VIEW_WORDS or (not body and component is None):
+            current = str(raffle.get("poster") or "")
+            lines = [
+                f"🖼️ {texts.raffle_label(raffle)}的奖品配图：{'已设置' if current else '未设置'}",
+            ]
+            if current:
+                lines.append(f"文件：{current}")
+            lines.append("")
+            lines.append(
+                "设置：回复一张图片后发送本命令，或 抽奖 海报 <图片链接>" + suffix
+            )
+            if current:
+                lines.append("清除：抽奖 海报 清空" + suffix)
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if url is not None:
+            rel = await poster.store_from_url(url, self.data_dir, group_id, seq)
+        else:
+            if component is None:
+                raise ValueError(
+                    "没有看到图片。请**回复**一张图片后再发送本命令，"
+                    "或者把图片链接写在命令后面，例如：\n"
+                    f"抽奖 海报 {group_id} https://example.com/prize.png",
+                )
+            rel = await poster.store_from_event(event, self.data_dir, group_id, seq)
+
+        self.db.update_raffle(raffle_id, poster=rel or "")
+        self._sweep_posters()
+        yield event.plain_result(
+            f"🖼️ 已为{texts.raffle_label(raffle)}设置奖品配图（{rel}）。\n"
+            "之后的群内提醒会带上它。"
         )
 
     async def _h_full(
@@ -1498,11 +1627,12 @@ class GroupLotteryPlugin(Star):
             allow_at=use_real_at,
         )
 
-        # 顺带按群裁剪历史，避免数据库无限增长
+        # 顺带按群裁剪历史，避免数据库无限增长；被裁掉的场次留下的配图一起清掉
         try:
             self.db.prune_history(int(self._cfg("history_limit", 200) or 200))
         except Exception as exc:
             logger.warning(f"[群抽奖] 历史记录清理失败：{exc}")
+        self._sweep_posters()
 
         logger.info(
             f"[群抽奖] {texts.raffle_label(raffle)}「{raffle.get('title', '')}」开奖完成："
@@ -1596,7 +1726,13 @@ class GroupLotteryPlugin(Star):
                     kind=kind,
                     now=now,
                 )
-                sent = await send_group_text(self.context, umo, text, allow_at=False)
+                sent = await send_group_text(
+                    self.context,
+                    umo,
+                    text,
+                    allow_at=False,
+                    images=self._poster_images(raffle),
+                )
             except Exception as exc:
                 logger.warning(f"[群抽奖] 第 {raffle_id} 期提醒发送异常：{exc}")
                 sent = False

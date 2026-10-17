@@ -7,11 +7,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
+import shutil
 import time
 from pathlib import Path
 
 import pytest
 from astrbot.api import AstrBotConfig
+from astrbot.api.message_components import Image
 from astrbot.api.star import Context, StarTools
 from astrbot_plugin_group_lottery.core.db import LotteryDB
 from astrbot_plugin_group_lottery.core.notifier import resolve_bot
@@ -110,6 +114,19 @@ class _MessageObj:
         self.message_id = ""
 
 
+class _Reply:
+    """替代 ``message_components.Reply``：``chain`` 里是被引用消息的组件。
+
+    AstrBot 的 aiocqhttp 适配器会把 ``get_msg`` 取回的原消息整条链塞进这里，
+    所以「回复一张图再发命令」这条路才走得通。
+    """
+
+    type = "reply"
+
+    def __init__(self, chain=None) -> None:
+        self.chain = list(chain or [])
+
+
 class FakeEvent:
     """最小可用的 AstrMessageEvent 替身。
 
@@ -129,6 +146,7 @@ class FakeEvent:
         role: str = "member",
         is_admin: bool = False,
         unique_session: bool = False,
+        components=None,
     ) -> None:
         self.message_str = message_str
         self._sender = _Sender(user_id, nickname, role)
@@ -139,6 +157,8 @@ class FakeEvent:
         self._stopped = False
         self.bot = None
         self.message_obj = _MessageObj(self._sender, group_id, private)
+        # 本条消息自带的组件（图片附件等）
+        self.message_obj.message = list(components or [])
         if private:
             session_id = user_id
         elif unique_session:
@@ -167,6 +187,9 @@ class FakeEvent:
 
     def get_group_id(self) -> str:
         return "" if self._private else self._group_id
+
+    def get_messages(self) -> list:
+        return list(self.message_obj.message)
 
     def get_platform_id(self) -> str:
         return PLATFORM_ID
@@ -226,6 +249,10 @@ def plugin() -> GroupLotteryPlugin:
     data_dir.mkdir(parents=True, exist_ok=True)
     db_path = data_dir / f"case_{time.time_ns():x}.db"
 
+    # 配图目录是插件级共享的，用例之间必须清干净，否则会互相数到对方的文件
+    covers = StarTools.get_data_dir("astrbot_plugin_group_lottery") / "covers"
+    shutil.rmtree(covers, ignore_errors=True)
+
     instance = GroupLotteryPlugin(context, config)
     instance.db.close()
     instance.db = LotteryDB(db_path)
@@ -233,6 +260,7 @@ def plugin() -> GroupLotteryPlugin:
     yield instance
 
     instance.db.close()
+    shutil.rmtree(covers, ignore_errors=True)
     for suffix in ("", "-wal", "-shm"):
         try:
             Path(str(db_path) + suffix).unlink(missing_ok=True)
@@ -258,19 +286,52 @@ def texts_of(results: list) -> str:
     return "\n".join(str(item[1]) for item in results if item and item[0] == "plain")
 
 
+def _render_component(comp) -> str:
+    """把单个消息组件渲染成可断言的短文本。"""
+    text = getattr(comp, "text", None)
+    if text is not None:
+        return text
+    if str(getattr(comp, "type", "")) == "image":
+        origin = str(getattr(comp, "path", "") or getattr(comp, "file", ""))
+        return f"<img:{origin.replace(chr(92), '/').rsplit('/', 1)[-1]}>"
+    return f"<at:{getattr(comp, 'qq', '')}>"
+
+
 def sent_texts(plugin: GroupLotteryPlugin, umo: str | None = None) -> list[str]:
     """取出插件通过 context.send_message 主动发出的文本。"""
     out = []
     for session, chain in plugin.context.sent:
         if umo and session != umo:
             continue
-        parts = []
-        for comp in getattr(chain, "chain", []):
-            parts.append(
-                getattr(comp, "text", None) or f"<at:{getattr(comp, 'qq', '')}>"
-            )
+        parts = [_render_component(comp) for comp in getattr(chain, "chain", [])]
         out.append("".join(parts))
     return out
+
+
+def png_bytes(width: int = 64, height: int = 48, color=(200, 30, 30)) -> bytes:
+    """造一张真 PNG 字节（插件本身也依赖 Pillow，测试直接用没问题）。"""
+    from PIL import Image as PILImage
+
+    buffer = io.BytesIO()
+    PILImage.new("RGB", (width, height), color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def image_component(payload: bytes | None = None):
+    """造一个图片组件，内容是真 PNG。"""
+    data = png_bytes() if payload is None else payload
+    return Image.fromBase64(base64.b64encode(data).decode())
+
+
+def reply_to(*components) -> _Reply:
+    """造一个「引用消息」组件（被引用消息的组件放进 chain）。"""
+    return _Reply(components)
+
+
+def poster_files(plugin: GroupLotteryPlugin) -> list[Path]:
+    """列出插件数据目录下的配图文件。"""
+    directory = plugin.data_dir / "covers"
+    return sorted(directory.iterdir()) if directory.is_dir() else []
 
 
 def admin_event(text: str, *, bot_role: str | None = None, **kwargs) -> FakeEvent:
@@ -1967,3 +2028,202 @@ def test_leftover_keys_dm_uses_temp_session(plugin: GroupLotteryPlugin):
     announce = sent_texts(plugin, GROUP_UMO)[-1]
     assert "另有 2 条密钥未送出" in announce
     assert "L-2" not in announce
+
+
+# ---------------------------------------------------- 奖品配图（海报）
+
+
+def test_publish_with_replied_image_carries_poster(plugin: GroupLotteryPlugin):
+    """回复一张奖品截图再发布，公告里就带上这张图。"""
+    event = admin_event(
+        "抽奖 发布 月卡 2",
+        components=[reply_to(image_component())],
+    )
+    out = texts_of(run(send(plugin, event)))
+
+    assert "奖品配图已随公告一起发出" in out
+    announce = sent_texts(plugin, GROUP_UMO)[0]
+    assert "<img:888888-1.jpg>" in announce
+
+    raffle = plugin.db.get_open_raffle(GROUP_UMO)
+    assert raffle["poster"] == "covers/888888-1.jpg"
+    assert [p.name for p in poster_files(plugin)] == ["888888-1.jpg"]
+
+
+def test_publish_with_inline_image_carries_poster(plugin: GroupLotteryPlugin):
+    """图片和命令写在同一条消息里也能取到。"""
+    event = admin_event("抽奖 发布 月卡 1", components=[image_component()])
+    run(send(plugin, event))
+
+    assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == "covers/888888-1.jpg"
+
+
+def test_publish_without_image_has_no_poster(plugin: GroupLotteryPlugin):
+    out = texts_of(run(send(plugin, admin_event("抽奖 发布 月卡 1"))))
+
+    assert "奖品配图已随公告一起发出" not in out
+    assert "配图没保存成功" not in out
+    assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == ""
+    assert poster_files(plugin) == []
+    assert "<img:" not in sent_texts(plugin, GROUP_UMO)[0]
+
+
+def test_publish_survives_broken_image(plugin: GroupLotteryPlugin):
+    """配图坏掉不能让发布失败，只提示一句。"""
+    broken = Image.fromBase64(base64.b64encode(b"not an image").decode())
+    event = admin_event("抽奖 发布 月卡 1", components=[broken])
+    out = texts_of(run(send(plugin, event)))
+
+    assert "抽奖已发布" in out
+    assert "⚠️ 配图没保存成功" in out
+    assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == ""
+    # 公告照发，只是没有图
+    assert "<img:" not in sent_texts(plugin, GROUP_UMO)[0]
+
+
+def test_poster_command_from_private_by_group_id(plugin: GroupLotteryPlugin):
+    """私聊里按群号给当前场次补一张图。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 1")))
+    out = texts_of(
+        run(
+            send(
+                plugin,
+                private_admin_event(
+                    "抽奖 海报 888888",
+                    components=[reply_to(image_component())],
+                ),
+            ),
+        ),
+    )
+
+    assert "已为第 1 期设置奖品配图" in out
+    assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == "covers/888888-1.jpg"
+
+
+def test_poster_command_accepts_url(plugin: GroupLotteryPlugin, url_images):
+    """命令里直接给链接时，按链接下载图片。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 1")))
+    link = "https://example.com/prize.png"
+    url_images[link] = png_bytes(120, 90)
+
+    out = texts_of(run(send(plugin, private_admin_event(f"抽奖 海报 888888 {link}"))))
+
+    assert "已为第 1 期设置奖品配图" in out
+    assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == "covers/888888-1.jpg"
+
+
+def test_poster_command_view_and_clear(plugin: GroupLotteryPlugin):
+    run(send(plugin, admin_event("抽奖 发布 月卡 1")))
+    assert "未设置" in texts_of(run(send(plugin, admin_event("抽奖 海报"))))
+
+    run(send(plugin, admin_event("抽奖 海报", components=[image_component()])))
+    assert "已设置" in texts_of(run(send(plugin, admin_event("抽奖 海报"))))
+
+    out = texts_of(run(send(plugin, admin_event("抽奖 海报 清空"))))
+    assert "已清除第 1 期的奖品配图" in out
+    assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == ""
+    assert poster_files(plugin) == []
+
+
+def test_poster_command_clear_when_absent(plugin: GroupLotteryPlugin):
+    run(send(plugin, admin_event("抽奖 发布 月卡 1")))
+    out = texts_of(run(send(plugin, admin_event("抽奖 海报 清空"))))
+    assert "本来就没有" in out
+
+
+def test_poster_command_without_image_asks_for_one(plugin: GroupLotteryPlugin):
+    """既没带图也没给链接时，明确告诉管理员怎么给图。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 1")))
+    out = texts_of(run(send(plugin, admin_event("抽奖 海报 看看"))))
+
+    assert "没有看到图片" in out
+
+
+def test_poster_command_reports_empty_download(plugin: GroupLotteryPlugin):
+    """链接取不回内容时报错，而不是静默写个空配图。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 1")))
+    out = texts_of(run(send(plugin, admin_event("抽奖 海报 https://x/y"))))
+
+    assert "没有读到图片内容" in out
+    assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == ""
+
+
+def test_poster_command_requires_open_raffle(plugin: GroupLotteryPlugin):
+    out = texts_of(
+        run(send(plugin, admin_event("抽奖 海报", components=[image_component()])))
+    )
+    assert "没有进行中的抽奖" in out
+
+
+def test_poster_command_requires_admin(plugin: GroupLotteryPlugin):
+    run(send(plugin, admin_event("抽奖 发布 月卡 1")))
+    event = FakeEvent("抽奖 海报", components=[image_component()])
+    out = texts_of(run(send(plugin, event)))
+
+    assert "仅群主 / 管理员" in out
+    assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == ""
+
+
+def test_reminder_carries_poster(plugin: GroupLotteryPlugin):
+    """配图要跟着群内提醒一起发（用户要求的两处之一）。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 1 定时 +6h")))
+    run(send(plugin, admin_event("抽奖 海报", components=[image_component()])))
+
+    raffle = plugin.db.get_open_raffle(GROUP_UMO)
+    plugin.db.update_raffle(int(raffle["id"]), next_remind_at=int(time.time()) - 1)
+    plugin.context.sent.clear()
+    run(plugin._remind_due_raffles())
+
+    reminder = sent_texts(plugin, GROUP_UMO)[-1]
+    assert "抽奖还在进行中" in reminder
+    assert "<img:888888-1.jpg>" in reminder
+    assert "@全体成员" not in reminder and "<at:" not in reminder
+
+
+def test_draw_announce_does_not_carry_poster(plugin: GroupLotteryPlugin):
+    """开奖公告不带图（用户选定的范围：只有发布公告和定期提醒带）。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 1")))
+    run(send(plugin, admin_event("抽奖 海报", components=[image_component()])))
+    run(send(plugin, FakeEvent("抽奖 参与", user_id="1001", nickname="甲")))
+    run(send(plugin, admin_event("抽奖 开奖")))
+
+    announce = sent_texts(plugin, GROUP_UMO)[-1]
+    assert "中奖" in announce
+    assert "<img:" not in announce
+
+
+def test_publish_with_poster_keeps_at_all(plugin: GroupLotteryPlugin):
+    """@全体成员 和配图要能同时出现在一条公告里。"""
+    event = admin_event(
+        "抽奖 发布 月卡 1",
+        bot_role="admin",
+        components=[reply_to(image_component())],
+    )
+    run(send(plugin, event))
+
+    announce = sent_texts(plugin, GROUP_UMO)[0]
+    assert announce.startswith("<at:all>")
+    assert "<img:888888-1.jpg>" in announce
+
+
+def test_sweep_posters_drops_files_of_deleted_raffles(plugin: GroupLotteryPlugin):
+    """场次被裁掉后，它的配图文件也要跟着被清掉。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 1", components=[image_component()])))
+    run(send(plugin, admin_event("抽奖 取消")))
+    run(
+        send(
+            plugin,
+            admin_event("抽奖 发布 月卡 2", components=[reply_to(image_component())]),
+        )
+    )
+
+    assert len(poster_files(plugin)) == 2
+
+    # 模拟历史裁剪：直接把第一场从库里删掉，再走一次清理
+    kept = plugin.db.get_open_raffle(GROUP_UMO)
+    for row in plugin.db.list_raffles(umo=GROUP_UMO, limit=50):
+        if int(row["id"]) != int(kept["id"]):
+            plugin.db.delete_raffle(int(row["id"]))
+    plugin._sweep_posters()
+
+    assert [p.name for p in poster_files(plugin)] == ["888888-2.jpg"]

@@ -45,6 +45,7 @@ def _decorate(raffle: dict[str, Any]) -> dict[str, Any]:
     item["seq"] = texts.raffle_no(item)
     item["remind_label"] = humanize_interval(int(item.get("remind_interval") or 0))
     item["next_remind_at_str"] = format_ts(item.get("next_remind_at"))
+    item["has_poster"] = bool(str(item.get("poster") or ""))
     return item
 
 

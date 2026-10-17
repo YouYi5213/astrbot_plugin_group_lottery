@@ -335,7 +335,7 @@ function tableOfOpen(rows) {
     <tbody>${rows.map(r => `<tr>
       <td class="mono">#${r.seq}</td>
       <td class="mono">${esc(r.group_id)}</td>
-      <td>${esc(r.title)}</td>
+      <td>${r.has_poster ? "🖼️ " : ""}${esc(r.title)}</td>
       <td>${Number(r.winner_count || 1)}</td>
       <td>${Number(r.participant_count || 0)}</td>
       <td>${r.prize_kind === "key"
@@ -368,7 +368,7 @@ async function loadRaffles() {
       <tbody>${rows.map(r => `<tr>
         <td class="mono">#${r.seq}</td>
         <td class="mono">${esc(r.group_id)}</td>
-        <td>${esc(r.title)}</td>
+        <td>${r.has_poster ? "🖼️ " : ""}${esc(r.title)}</td>
         <td><span class="pill ${esc(r.status)}">${esc(r.status_label)}</span></td>
         <td>${Number(r.winner_count || 1)}</td>
         <td>${Number(r.participant_count || 0)}</td>
@@ -451,6 +451,9 @@ async function openDetail(id, seq) {
         <div class="k">群内提醒</div><div>${esc(raffle.remind_label || "不通知")}${
           raffle.next_remind_at_str ? ` <span class="hint">· 下一次 ${esc(raffle.next_remind_at_str)}</span>` : ""
         }</div>
+        <div class="k">奖品配图</div><div>${raffle.has_poster
+          ? `已设置 <span class="hint mono">${esc(raffle.poster || "")}</span>`
+          : `未设置 <span class="hint">· 群里回复一张图后发送「抽奖 海报」</span>`}</div>
         <div class="k">满员开奖</div><div>${raffle.min_players ? Number(raffle.min_players) + " 人" : "未设置"}</div>
         <div class="k">触发方式</div><div>${esc(raffle.trigger_label || "—")}</div>
         <div class="k">创建 / 开奖</div><div class="hint">${esc(raffle.created_at_str)} / ${esc(raffle.drawn_at_str || "—")}</div>

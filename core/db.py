@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS raffles (
     closed_note    TEXT    NOT NULL DEFAULT '',
     remind_interval    INTEGER NOT NULL DEFAULT 0,
     next_remind_at     INTEGER,
-    remind_before_sent INTEGER NOT NULL DEFAULT 0
+    remind_before_sent INTEGER NOT NULL DEFAULT 0,
+    poster             TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_raffles_umo    ON raffles(umo, status);
 CREATE INDEX IF NOT EXISTS idx_raffles_status ON raffles(status, draw_at);
@@ -100,6 +101,7 @@ _UPDATABLE_RAFFLE_FIELDS = {
     "remind_interval",
     "next_remind_at",
     "remind_before_sent",
+    "poster",
 }
 
 
@@ -127,6 +129,7 @@ class LotteryDB:
             self._conn.executescript(_SCHEMA)
             self._migrate_session_isolation()
             self._migrate_add_seq()
+            self._migrate_add_poster_column()
             self._conn.commit()
 
     def _columns(self, table: str) -> set[str]:
@@ -179,6 +182,16 @@ class LotteryDB:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_raffles_remind ON raffles(status, next_remind_at)",
         )
+
+    def _migrate_add_poster_column(self) -> None:
+        """补上奖品配图列（老库升级用）。"""
+        try:
+            if "poster" not in self._columns("raffles"):
+                self._conn.execute(
+                    "ALTER TABLE raffles ADD COLUMN poster TEXT NOT NULL DEFAULT ''",
+                )
+        except Exception as exc:  # pragma: no cover - 迁移失败不应阻断启动
+            logger.warning(f"[群抽奖] 配图列迁移失败（可忽略）：{exc}")
 
     def _migrate_session_isolation(self) -> None:
         """把受 ``unique_session`` 污染的群标识修正回真实群号。
@@ -675,6 +688,16 @@ class LotteryDB:
             LIMIT 200
             """,
         )
+
+    def list_poster_keys(self) -> set[str]:
+        """列出所有还挂着配图的场次，键形如 ``"123456-3"``。
+
+        用于清理已经随历史裁剪掉的场次留下的图片文件。
+        """
+        rows = self._query(
+            "SELECT group_id, seq FROM raffles WHERE COALESCE(poster, '') <> ''",
+        )
+        return {f"{row['group_id']}-{int(row['seq'] or 0)}" for row in rows}
 
     def prune_history(self, per_group_limit: int = 200) -> int:
         """按群裁剪历史开奖记录，返回删除的场次数。

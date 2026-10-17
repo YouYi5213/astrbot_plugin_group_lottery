@@ -7,10 +7,13 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 PLUGIN_PARENT = PLUGIN_ROOT.parent
@@ -19,6 +22,18 @@ for _path in (str(PLUGIN_ROOT), str(PLUGIN_PARENT)):
         sys.path.insert(0, _path)
 
 _DATA_DIR = PLUGIN_ROOT / "tests" / ".tmp" / "plugin_data"
+
+#: 模拟「AstrBot 按链接下载图片」：测试往这里塞 URL → 图片字节。
+#: 真实实现里 ``Image.convert_to_base64()`` 会走 MediaResolver 去下载。
+URL_BYTES: dict[str, bytes] = {}
+
+
+@pytest.fixture
+def url_images():
+    """让被测代码能从链接「下载」到图片，用完清空。"""
+    URL_BYTES.clear()
+    yield URL_BYTES
+    URL_BYTES.clear()
 
 
 # --------------------------------------------------------------- 装饰器桩
@@ -91,9 +106,48 @@ class AtAll:
 
 
 class Image:
-    """替代 ``message_components.Image``。"""
+    """替代 ``message_components.Image``。
+
+    ``convert_to_base64`` 按真实行为返回纯 base64：本地文件就读文件，网络图走
+    ``URL_BYTES`` 这个由测试填充的注册表（模拟 MediaResolver 下载）。
+    """
 
     type = "image"
+
+    def __init__(
+        self,
+        file: str = "",
+        url: str = "",
+        path: str = "",
+        **_kwargs,
+    ) -> None:
+        self.file = file
+        self.url = url
+        self.path = path
+
+    @classmethod
+    def fromFileSystem(cls, path) -> Image:
+        target = Path(path)
+        return cls(file=target.resolve(strict=False).as_uri(), path=str(target))
+
+    @classmethod
+    def fromURL(cls, url: str) -> Image:
+        return cls(file=url, url=url)
+
+    @classmethod
+    def fromBase64(cls, data: str) -> Image:
+        return cls(file=f"base64://{data}")
+
+    async def convert_to_base64(self) -> str:
+        """按真实语义返回**不带前缀**的纯 base64。"""
+        if self.path:
+            return base64.b64encode(Path(self.path).read_bytes()).decode()
+        if self.file.startswith("base64://"):
+            return self.file[len("base64://") :]
+        return base64.b64encode(URL_BYTES.get(self.url, b"")).decode()
+
+    def __repr__(self) -> str:
+        return f"Image({self.file!r})"
 
 
 class MessageChain:

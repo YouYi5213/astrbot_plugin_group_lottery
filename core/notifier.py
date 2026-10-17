@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
@@ -136,8 +137,39 @@ def platform_supports_at(context: Any, umo: str) -> bool:
     return True
 
 
-def build_at_chain(user_ids: Sequence[str], text: str) -> list[Any] | None:
-    """构造「@A @B 文本」的消息链；组件不可用时返回 None。"""
+def build_image_parts(images: Sequence[str | Path] = ()) -> list[Any]:
+    """把本地图片路径转成消息组件。
+
+    发送时不需要关心协议端能否读到这些路径：aiocqhttp 适配器会把 ``Image``
+    组件统一转成 ``base64://`` 再发出去。
+
+    Args:
+        images: 本地图片路径列表。
+
+    Returns:
+        图片组件列表；组件不可用或某个文件读不到时，跳过该项。
+    """
+    mc = _components()
+    if mc is None:
+        return []
+    image_cls = getattr(mc, "Image", None)
+    if image_cls is None:
+        return []
+    parts: list[Any] = []
+    for item in images or ():
+        try:
+            parts.append(image_cls.fromFileSystem(str(item)))
+        except Exception as exc:
+            logger.warning(f"[群抽奖] 配图加载失败（{item}）：{exc}")
+    return parts
+
+
+def build_at_chain(
+    user_ids: Sequence[str],
+    text: str,
+    images: Sequence[str | Path] = (),
+) -> list[Any] | None:
+    """构造「@A @B 文本 [配图]」的消息链；组件不可用时返回 None。"""
     mc = _components()
     if mc is None:
         return None
@@ -158,6 +190,7 @@ def build_at_chain(user_ids: Sequence[str], text: str) -> list[Any] | None:
         parts.append(mc.Plain(text))
     except Exception:
         return None
+    parts.extend(build_image_parts(images))
     return parts
 
 
@@ -172,11 +205,15 @@ def _wrap(chain: list[Any]) -> Any:
     return chain
 
 
-def build_at_all_chain(text: str) -> list[Any] | None:
-    """构造「@全体成员 + 正文」的消息组件列表。
+def build_at_all_chain(
+    text: str,
+    images: Sequence[str | Path] = (),
+) -> list[Any] | None:
+    """构造「@全体成员 + 正文 + 配图」的消息组件列表。
 
     Args:
         text: 正文。
+        images: 附在正文后面的本地图片路径。
 
     Returns:
         组件列表；平台组件不可用或缺少 ``AtAll`` 时返回 ``None``。
@@ -188,7 +225,7 @@ def build_at_all_chain(text: str) -> list[Any] | None:
     if at_all is None:
         return None
     try:
-        return [at_all(), mc.Plain(" " + text)]
+        return [at_all(), mc.Plain(" " + text), *build_image_parts(images)]
     except Exception:
         return None
 
@@ -241,8 +278,9 @@ async def send_group_text(
     at_user_ids: Sequence[str] = (),
     allow_at: bool = True,
     at_all: bool = False,
+    images: Sequence[str | Path] = (),
 ) -> bool:
-    """向群聊会话发送文本，可选在文首 @全体成员 或 @ 若干人。
+    """向群聊会话发送文本，可选在文首 @全体成员 / @ 若干人，末尾附图片。
 
     真实 @ 失败（平台不支持、机器人不是管理员、@全体成员 配额用尽、被风控等）
     时自动退回纯文本，保证公告一定发得出去。
@@ -254,6 +292,7 @@ async def send_group_text(
         at_user_ids: 需要 @ 的用户 ID 列表。
         allow_at: 是否尝试真实 @。
         at_all: 是否尝试 @全体成员（优先级高于 ``at_user_ids``）。
+        images: 附在正文后面的本地图片路径（奖品配图）。
 
     Returns:
         是否发送成功。
@@ -264,7 +303,7 @@ async def send_group_text(
         return False
 
     if at_all and platform_supports_at(context, umo):
-        chain = build_at_all_chain(text)
+        chain = build_at_all_chain(text, images)
         if chain:
             try:
                 if await context.send_message(umo, _wrap(chain)) is not False:
@@ -273,7 +312,7 @@ async def send_group_text(
                 logger.warning(f"[群抽奖] @全体成员 发送失败，降级为普通公告：{exc}")
 
     if allow_at and at_user_ids and platform_supports_at(context, umo):
-        chain = build_at_chain(at_user_ids, text)
+        chain = build_at_chain(at_user_ids, text, images)
         if chain:
             try:
                 if await context.send_message(umo, _wrap(chain)) is not False:
@@ -282,7 +321,10 @@ async def send_group_text(
                 logger.warning(f"[群抽奖] 真实 @ 发送失败，降级为纯文本：{exc}")
 
     try:
-        sent = await context.send_message(umo, _wrap([mc.Plain(text)]))
+        sent = await context.send_message(
+            umo,
+            _wrap([mc.Plain(text), *build_image_parts(images)]),
+        )
     except Exception as exc:
         logger.error(f"[群抽奖] 群消息发送失败：{exc}")
         return False

@@ -1,2 +1,5 @@
-# 群抽奖系统只依赖 Python 标准库（sqlite3 / random / asyncio），
-# 无需额外第三方依赖。此处保留文件以符合插件目录规范。
+# 群抽奖系统的依赖：Python 标准库（sqlite3 / random / asyncio）+ Pillow。
+#
+# Pillow 用于奖品配图：把手机截图压到最长边 1280 / JPEG 质量 85 再发到群里。
+# 没装也能用，只是跳过压缩按原图发送（超过 2MB 的图会被拒绝）。
+Pillow>=9.0.0

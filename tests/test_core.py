@@ -7,15 +7,18 @@
 
 from __future__ import annotations
 
+import io
 import random
+import shutil
 import time
+import types
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 # sys.path 由同目录的 conftest.py 统一注入，这里直接按包名导入即可
-from core import texts
+from core import poster, texts
 from core.args import PublishParseError, parse_publish
 from core.db import LotteryDB
 from core.engine import available_seats, draw, parse_keys
@@ -839,6 +842,44 @@ def test_reminder_columns_survive_legacy_database():
             pass
 
 
+def test_poster_column_survives_legacy_database():
+    """老库（没有 poster 列）升级后应该能补列并正常读写。"""
+    workdir = Path(__file__).resolve().parent / ".tmp"
+    workdir.mkdir(parents=True, exist_ok=True)
+    db_path = workdir / f"legacy_poster_{random.getrandbits(32):08x}.db"
+    database = LotteryDB(db_path)
+    database._conn.execute("ALTER TABLE raffles DROP COLUMN poster")
+    database._conn.commit()
+    database.close()
+
+    reopened = LotteryDB(db_path)
+    assert "poster" in reopened._columns("raffles")
+    raffle_id = reopened.create_raffle(umo="u", group_id="1", title="月卡")
+    reopened.update_raffle(raffle_id, poster="covers/1-1.jpg")
+    assert reopened.get_raffle(raffle_id)["poster"] == "covers/1-1.jpg"
+    assert reopened.list_poster_keys() == {"1-1"}
+    reopened.close()
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            Path(str(db_path) + suffix).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def test_list_poster_keys_only_returns_configured_raffles(db):
+    plain = db.create_raffle(umo="u", group_id="888888", title="没有配图")
+    with_poster = db.create_raffle(umo="u", group_id="888888", title="有配图")
+    db.update_raffle(with_poster, poster="covers/888888-2.jpg")
+
+    assert db.create_raffle(umo="u", group_id="999999", title="别的群") > 0
+    assert db.list_poster_keys() == {"888888-2"}
+
+    # 清空之后就不再被引用
+    db.update_raffle(with_poster, poster="")
+    assert db.list_poster_keys() == set()
+    assert db.get_raffle(plain)["poster"] == ""
+
+
 def _raffle_stub(**overrides):
     base = {
         "id": 1,
@@ -912,3 +953,191 @@ def test_build_reminder_never_mentions_at_all_marker():
             now=now,
         )
         assert "@全体成员" not in text
+
+
+# ------------------------------------------------------------------ 奖品配图
+
+
+def _png(width: int = 64, height: int = 48, mode: str = "RGB") -> bytes:
+    """造一张真 PNG（插件依赖 Pillow，测试直接用没问题）。"""
+    from PIL import Image as PILImage
+
+    buffer = io.BytesIO()
+    PILImage.new(mode, (width, height), (200, 30, 30)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _animated_gif() -> bytes:
+    """造一张两帧 GIF。
+
+    帧内容必须真的不同：两帧像素一致时 Pillow 会把它写成单帧，测不到动图分支。
+    """
+    from PIL import Image as PILImage
+
+    first = PILImage.new("RGB", (16, 16), (255, 0, 0)).convert("P")
+    second = PILImage.new("RGB", (16, 16), (0, 0, 255)).convert("P")
+    buffer = io.BytesIO()
+    first.save(
+        buffer,
+        format="GIF",
+        save_all=True,
+        append_images=[second],
+        duration=100,
+        loop=0,
+    )
+    return buffer.getvalue()
+
+
+@pytest.fixture()
+def poster_dir() -> Path:
+    """配图目录：本机 ``tmp_path`` 不可用，统一放到 ``tests/.tmp`` 下。"""
+    target = Path(__file__).resolve().parent / ".tmp" / "posters"
+    shutil.rmtree(target, ignore_errors=True)
+    target.mkdir(parents=True, exist_ok=True)
+    yield target
+    shutil.rmtree(target, ignore_errors=True)
+
+
+def test_sniff_ext_recognizes_common_formats():
+    assert poster.sniff_ext(_png()) == "png"
+    assert poster.sniff_ext(b"\xff\xd8\xff\xe0abc") == "jpg"
+    assert poster.sniff_ext(b"GIF89a....") == "gif"
+    assert poster.sniff_ext(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == "webp"
+    assert poster.sniff_ext(b"BM....") == "bmp"
+    assert poster.sniff_ext(b"definitely not an image") is None
+
+
+def test_parse_url_only_accepts_http():
+    assert poster.parse_url(" https://a/b.png ") == "https://a/b.png"
+    assert poster.parse_url("http://a/b.png") == "http://a/b.png"
+    assert poster.parse_url("查看") is None
+    assert poster.parse_url("ftp://a/b.png") is None
+    assert poster.parse_url("") is None
+
+
+def test_compress_image_shrinks_and_resizes():
+    """大图压成 JPEG，并且最长边不超过上限。"""
+    from PIL import Image as PILImage
+
+    big = _png(2400, 1800)
+    packed, ext = poster.compress_image(big)
+    assert ext == "jpg"
+    assert len(packed) < len(big)
+    with PILImage.open(io.BytesIO(packed)) as img:
+        assert max(img.size) <= poster.MAX_EDGE
+
+
+def test_compress_image_keeps_transparency_as_png():
+    from PIL import Image as PILImage
+
+    buffer = io.BytesIO()
+    PILImage.new("RGBA", (80, 80), (0, 0, 0, 0)).save(buffer, format="PNG")
+    _packed, ext = poster.compress_image(buffer.getvalue())
+    assert ext == "png"
+
+
+def test_compress_image_keeps_animated_gif_intact():
+    """动图重编码会掉帧，必须原样保留。"""
+    gif = _animated_gif()
+    packed, ext = poster.compress_image(gif)
+    assert ext == "gif"
+    assert packed == gif
+
+
+def test_compress_image_rejects_garbage():
+    with pytest.raises(ValueError, match="无法识别或已损坏"):
+        poster.compress_image(b"definitely not an image")
+
+
+def test_save_and_delete_poster_round_trip(poster_dir):
+    rel = poster.save_poster(poster_dir, "888888", 3, _png())
+    assert rel == "covers/888888-3.jpg"
+
+    saved = poster.resolve_path(poster_dir, rel)
+    assert saved is not None and saved.is_file()
+
+    assert poster.delete_poster(poster_dir, "888888", 3) == 1
+    assert not saved.exists()
+    assert poster.resolve_path(poster_dir, rel) is None
+    # 再删一次不会报错
+    assert poster.delete_poster(poster_dir, "888888", 3) == 0
+
+
+def test_save_poster_replaces_previous_extension(poster_dir):
+    """换图时旧后缀的残留要清掉，否则目录会越堆越多。"""
+    from PIL import Image as PILImage
+
+    buffer = io.BytesIO()
+    PILImage.new("RGBA", (40, 40), (0, 0, 0, 0)).save(buffer, format="PNG")
+    first = poster.save_poster(poster_dir, "888888", 1, buffer.getvalue())
+    assert first.endswith(".png")
+
+    second = poster.save_poster(poster_dir, "888888", 1, _png())
+    assert second.endswith(".jpg")
+    assert [p.name for p in (poster_dir / "covers").iterdir()] == ["888888-1.jpg"]
+
+
+def test_save_poster_rejects_empty_and_oversize(poster_dir):
+    with pytest.raises(ValueError, match="没有读到图片内容"):
+        poster.save_poster(poster_dir, "1", 1, b"")
+    with pytest.raises(ValueError, match="图片太大"):
+        poster.save_poster(poster_dir, "1", 1, b"x" * (poster.MAX_SOURCE_BYTES + 1))
+
+
+def test_resolve_path_rejects_traversal_and_missing(poster_dir):
+    assert poster.resolve_path(poster_dir, "") is None
+    assert poster.resolve_path(poster_dir, "../secrets.txt") is None
+    assert poster.resolve_path(poster_dir, "covers/../secrets.txt") is None
+
+
+def test_sweep_removes_orphans(poster_dir):
+    poster.save_poster(poster_dir, "888888", 1, _png())
+    poster.save_poster(poster_dir, "888888", 2, _png())
+
+    assert poster.sweep(poster_dir, {"888888-2"}) == 1
+    assert [p.name for p in (poster_dir / "covers").iterdir()] == ["888888-2.jpg"]
+
+
+class _FakeImageEvent:
+    """只带消息组件的极简事件。"""
+
+    def __init__(self, components) -> None:
+        self._components = list(components)
+        self.message_obj = types.SimpleNamespace(message=[])
+
+    def get_messages(self) -> list:
+        return list(self._components)
+
+
+def _comp(kind: str, **kwargs):
+    return types.SimpleNamespace(type=kind, **kwargs)
+
+
+def test_extract_image_prefers_own_attachment_over_reply():
+    attached = _comp("image")
+    replied = _comp("image")
+    event = _FakeImageEvent([_comp("reply", chain=[replied]), attached])
+    assert poster.extract_image(event) is attached
+
+
+def test_extract_image_falls_back_to_replied_message():
+    replied = _comp("image")
+    event = _FakeImageEvent([_comp("reply", chain=[_comp("plain"), replied])])
+    assert poster.extract_image(event) is replied
+
+
+def test_extract_image_returns_none_without_image():
+    event = _FakeImageEvent(
+        [_comp("plain"), _comp("reply", chain=[_comp("plain")])],
+    )
+    assert poster.extract_image(event) is None
+
+
+def test_extract_image_accepts_enum_style_type():
+    """真实组件里 ``type`` 是 ``ComponentType`` 枚举，要取 ``.value`` 比较。"""
+
+    class _ComponentType:
+        value = "image"
+
+    event = _FakeImageEvent([_comp("plain"), _comp(_ComponentType())])
+    assert poster.extract_image(event) is not None
