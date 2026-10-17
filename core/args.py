@@ -7,9 +7,11 @@
     抽奖 发布 <奖品名> [名额]
     抽奖 发布 <群号> <奖品名> [名额]
     抽奖 发布 <群号> <奖品名> [名额] 定时 20:00 满员 8 说明 手慢无
+    抽奖 发布 <群号> <奖品名> [名额] 海报 https://example.com/prize.png
 
-一行式里可选的选项关键字：``名额`` / ``定时`` / ``满员`` / ``私聊`` / ``说明``。
+一行式里可选的选项关键字：``名额`` / ``定时`` / ``满员`` / ``私聊`` / ``说明`` / ``海报``。
 第一个选项关键字之前的部分是「奖品名 + 名额」，之后按关键字切分。
+``海报`` 可以不带值（表示用本条消息或所回复消息里的图片），带值时是图片链接。
 """
 
 from __future__ import annotations
@@ -44,6 +46,8 @@ class PublishSpec:
     private_notify: bool | None = None
     description: str = ""
     poster_url: str = ""
+    # 命令里写了「海报」（不论有没有带链接）
+    poster_asked: bool = False
     # 解析过程中发现但不致命的问题，交由上层提示
     warnings: list[str] = field(default_factory=list)
 
@@ -166,11 +170,8 @@ def _parse_options(spec: PublishSpec, tokens: list[str]) -> None:
                 raise PublishParseError(f"说明过长（{MAX_DESC_LEN} 字以内）")
             spec.description = value
         elif keyword == "海报":
-            if not value:
-                raise PublishParseError(
-                    "「海报」后面要跟图片链接，例如：海报 https://example.com/prize.png"
-                    "（也可以回复一张图片后再发布）"
-                )
+            # 不带值表示「用本条消息（或所回复消息）里的图片」，带值则是图片链接
+            spec.poster_asked = True
             spec.poster_url = value
         else:  # pragma: no cover - 关键字表与分支一一对应
             spec.warnings.append(f"未知选项：{keyword}")

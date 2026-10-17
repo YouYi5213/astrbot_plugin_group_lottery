@@ -745,11 +745,19 @@ def test_parse_publish_poster_terminates_description():
     assert spec.description == "手慢无"
 
 
-def test_parse_publish_poster_requires_a_link():
-    with pytest.raises(PublishParseError, match="海报"):
-        parse_publish("月卡 海报")
-    with pytest.raises(PublishParseError, match="海报"):
-        parse_publish("月卡 海报 名额 2")
+def test_parse_publish_bare_poster_means_use_replied_image():
+    """只写「海报」不带链接 → 表示用本条消息（或所回复消息）里的图片。"""
+    spec = parse_publish("月卡 1 海报")
+    assert spec.poster_asked is True
+    assert spec.poster_url == ""
+
+    spec = parse_publish("月卡 1 海报 名额 2")
+    assert spec.poster_asked is True
+    assert spec.poster_url == ""
+    assert spec.winner_count == 2
+
+    # 没写「海报」时不会去认领回复里的图
+    assert parse_publish("月卡 1").poster_asked is False
 
 
 def test_parse_publish_rejects_bad_input():

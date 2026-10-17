@@ -930,15 +930,25 @@ class GroupLotteryPlugin(Star):
                 except Exception as exc:
                     stored, poster_error = None, str(exc)
 
-        if stored is None:
+        if stored is None and not poster_error and not spec.poster_asked:
+            # 命令里没提配图、消息里也没有图片，才去认领之前设好的待用配图
             pending = self.db.get_pending_poster(group_id)
             if pending:
                 adopted = poster.adopt(self.data_dir, pending, group_id, poster_seq)
                 if adopted:
                     stored = adopted
                     self.db.clear_pending_poster(group_id)
-                elif not poster_error:
+                else:
                     poster_error = "之前设好的配图文件已经找不到了，请重新发一张"
+        elif (
+            stored is None
+            and not poster_error
+            and spec.poster_asked
+            and not spec.poster_url
+        ):
+            poster_error = (
+                "没有读到图片：请回复一张图片后再发布，或在「海报」后面写上图片链接"
+            )
 
         if stored:
             self.db.update_raffle(raffle_id, poster=stored)

@@ -2058,6 +2058,35 @@ def test_publish_with_inline_image_carries_poster(plugin: GroupLotteryPlugin):
     assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == "covers/888888-1.jpg"
 
 
+def test_publish_with_bare_poster_option_uses_replied_image(
+    plugin: GroupLotteryPlugin,
+):
+    """用户报的场景：回复一张图，命令末尾写「海报」（不带链接）也要用上那张图。"""
+    event = private_admin_event(
+        "抽奖 发布 888888 Steam挺进地牢CDK 1 定时 15:15 满员 3 说明 Mamba out 海报",
+        components=[reply_to(image_component())],
+    )
+    out = texts_of(run(send(plugin, event)))
+
+    assert "奖品配图已随公告一起发出" in out
+    assert "说明：Mamba out" in out
+    assert "满员提前开奖：报名满 3 人" in out
+    assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == "covers/888888-1.jpg"
+    assert [p.name for p in poster_files(plugin)] == ["888888-1.jpg"]
+
+
+def test_publish_with_bare_poster_option_without_image_warns(
+    plugin: GroupLotteryPlugin,
+):
+    """写了「海报」但既没有图也没有链接时，只提示一句，抽奖照发。"""
+    out = texts_of(run(send(plugin, admin_event("抽奖 发布 月卡 1 海报"))))
+
+    assert "抽奖已发布" in out
+    assert "没有读到图片" in out
+    assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == ""
+    assert poster_files(plugin) == []
+
+
 def test_publish_without_image_has_no_poster(plugin: GroupLotteryPlugin):
     out = texts_of(run(send(plugin, admin_event("抽奖 发布 月卡 1"))))
 
