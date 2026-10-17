@@ -2148,11 +2148,128 @@ def test_poster_command_reports_empty_download(plugin: GroupLotteryPlugin):
     assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == ""
 
 
-def test_poster_command_requires_open_raffle(plugin: GroupLotteryPlugin):
+def test_poster_before_publish_is_kept_pending(plugin: GroupLotteryPlugin):
+    """还没有进行中的抽奖时，先设的图会存成「待用配图」，不再报错。"""
     out = texts_of(
         run(send(plugin, admin_event("抽奖 海报", components=[image_component()])))
     )
-    assert "没有进行中的抽奖" in out
+
+    assert "已存好群 888888 的奖品配图" in out
+    assert "下一场抽奖发布时会自动带上它" in out
+    assert plugin.db.get_pending_poster(GROUP_ID) == "covers/pending-888888.jpg"
+    assert [p.name for p in poster_files(plugin)] == ["pending-888888.jpg"]
+
+
+def test_pending_poster_is_used_by_next_publish(plugin: GroupLotteryPlugin):
+    """「先设海报、再发布」时公告要带上待用配图，并且用掉就不再重复。"""
+    run(send(plugin, admin_event("抽奖 海报", components=[image_component()])))
+    plugin.context.sent.clear()
+
+    out = texts_of(run(send(plugin, admin_event("抽奖 发布 月卡 1"))))
+
+    assert "奖品配图已随公告一起发出" in out
+    announce = sent_texts(plugin, GROUP_UMO)[0]
+    assert "<img:888888-1.jpg>" in announce
+    # 待用记录被认领走，文件也从 pending 改名到了第 1 期名下
+    assert plugin.db.get_pending_poster(GROUP_ID) == ""
+    assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == "covers/888888-1.jpg"
+    assert [p.name for p in poster_files(plugin)] == ["888888-1.jpg"]
+
+
+def test_pending_poster_from_private_by_group_id(plugin: GroupLotteryPlugin):
+    """私聊里也能在发布前先把图挂到指定群。"""
+    out = texts_of(
+        run(
+            send(
+                plugin,
+                private_admin_event(
+                    "抽奖 海报 888888",
+                    components=[reply_to(image_component())],
+                ),
+            )
+        )
+    )
+
+    assert "已存好群 888888 的奖品配图" in out
+    assert plugin.db.get_pending_poster(GROUP_ID) == "covers/pending-888888.jpg"
+
+    run(send(plugin, admin_event("抽奖 发布 月卡 1")))
+    assert "<img:888888-1.jpg>" in sent_texts(plugin, GROUP_UMO)[0]
+
+
+def test_pending_poster_replaced_by_next_set(plugin: GroupLotteryPlugin):
+    """重复设置只保留最后一张，不会越堆越多。"""
+    run(send(plugin, admin_event("抽奖 海报", components=[image_component()])))
+    run(
+        send(
+            plugin,
+            admin_event("抽奖 海报", components=[image_component(png_bytes(80, 60))]),
+        )
+    )
+
+    assert [p.name for p in poster_files(plugin)] == ["pending-888888.jpg"]
+
+
+def test_pending_poster_survives_sweep(plugin: GroupLotteryPlugin):
+    """待用配图还没被任何场次引用，清理时不能把它当孤儿删掉。"""
+    run(send(plugin, admin_event("抽奖 海报", components=[image_component()])))
+    plugin._sweep_posters()
+
+    assert [p.name for p in poster_files(plugin)] == ["pending-888888.jpg"]
+
+
+def test_pending_poster_cleared_by_clear(plugin: GroupLotteryPlugin):
+    run(send(plugin, admin_event("抽奖 海报", components=[image_component()])))
+    out = texts_of(run(send(plugin, admin_event("抽奖 海报 清空"))))
+
+    assert "已清除" in out
+    assert plugin.db.get_pending_poster(GROUP_ID) == ""
+    assert poster_files(plugin) == []
+
+
+def test_poster_view_reports_pending_state(plugin: GroupLotteryPlugin):
+    assert "未设置" in texts_of(run(send(plugin, admin_event("抽奖 海报"))))
+
+    run(send(plugin, admin_event("抽奖 海报", components=[image_component()])))
+    out = texts_of(run(send(plugin, admin_event("抽奖 海报"))))
+
+    assert "待用" in out
+    assert "还没有进行中的抽奖" in out
+
+
+def test_publish_attachment_wins_over_pending(plugin: GroupLotteryPlugin):
+    """发布时自带了图片就用自己的；待用那张留到下一场，不消耗。"""
+    run(send(plugin, admin_event("抽奖 海报", components=[image_component()])))
+
+    run(
+        send(
+            plugin,
+            admin_event(
+                "抽奖 发布 月卡 1",
+                components=[reply_to(image_component())],
+            ),
+        )
+    )
+
+    assert "<img:888888-1.jpg>" in sent_texts(plugin, GROUP_UMO)[0]
+    assert plugin.db.get_pending_poster(GROUP_ID) == "covers/pending-888888.jpg"
+
+
+def test_poster_on_open_raffle_rebroadcasts_announcement(plugin: GroupLotteryPlugin):
+    """公告已经发过也能补图：重新播报一次，且不带 @全体成员。"""
+    run(send(plugin, admin_event("抽奖 发布 月卡 1")))
+    plugin.context.sent.clear()
+
+    out = texts_of(
+        run(send(plugin, admin_event("抽奖 海报", components=[image_component()])))
+    )
+
+    assert "已重新在群里播报一次公告" in out
+    announcements = sent_texts(plugin, GROUP_UMO)
+    assert len(announcements) == 1
+    assert "<img:888888-1.jpg>" in announcements[0]
+    assert "<at:" not in announcements[0]
+    assert "抽奖 密钥" not in announcements[0]
 
 
 def test_poster_command_requires_admin(plugin: GroupLotteryPlugin):
@@ -2227,3 +2344,69 @@ def test_sweep_posters_drops_files_of_deleted_raffles(plugin: GroupLotteryPlugin
     plugin._sweep_posters()
 
     assert [p.name for p in poster_files(plugin)] == ["888888-2.jpg"]
+
+
+def test_publish_long_command_with_poster_link(plugin: GroupLotteryPlugin, url_images):
+    """用户要的长命令写法：发布时顺手带上海报链接。"""
+    link = "https://example.com/prize.png"
+    url_images[link] = png_bytes(200, 120)
+
+    out = texts_of(
+        run(
+            send(
+                plugin,
+                private_admin_event(
+                    "抽奖 发布 888888 Steam游戏转生魔塔CDK 1 定时 18:18 满员 3 "
+                    "说明 What can i say 海报 " + link,
+                ),
+            ),
+        )
+    )
+
+    assert "奖品配图已随公告一起发出" in out
+    assert "说明：What can i say" in out
+    assert "满员提前开奖：报名满 3 人" in out
+    announce = sent_texts(plugin, GROUP_UMO)[0]
+    assert "<img:888888-1.jpg>" in announce
+
+
+def test_publish_poster_link_wins_over_pending(plugin: GroupLotteryPlugin, url_images):
+    """命令里写了链接就用链接，待用那张留着下一场。"""
+    run(send(plugin, admin_event("抽奖 海报", components=[image_component()])))
+    link = "https://example.com/prize.png"
+    url_images[link] = png_bytes(200, 120)
+
+    run(send(plugin, admin_event(f"抽奖 发布 月卡 1 海报 {link}")))
+
+    assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == "covers/888888-1.jpg"
+    assert plugin.db.get_pending_poster(GROUP_ID) == "covers/pending-888888.jpg"
+
+
+def test_publish_with_bad_poster_link_still_publishes(plugin: GroupLotteryPlugin):
+    """链接写成非 http(s) 时只提示一句，抽奖照发。"""
+    out = texts_of(
+        run(send(plugin, admin_event("抽奖 发布 月卡 1 海报 ftp://x/y.png")))
+    )
+
+    assert "抽奖已发布" in out
+    assert "「海报」后面要跟 http/https 图片链接" in out
+    assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == ""
+    assert "<img:" not in sent_texts(plugin, GROUP_UMO)[0]
+
+
+def test_publish_poster_link_download_failure_still_publishes(
+    plugin: GroupLotteryPlugin,
+):
+    """链接下载不到内容时同样只提示一句。"""
+    out = texts_of(
+        run(
+            send(
+                plugin,
+                admin_event("抽奖 发布 月卡 1 海报 https://example.com/missing.png"),
+            ),
+        )
+    )
+
+    assert "抽奖已发布" in out
+    assert "配图没保存成功" in out
+    assert plugin.db.get_open_raffle(GROUP_UMO)["poster"] == ""

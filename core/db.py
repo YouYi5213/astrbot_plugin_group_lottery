@@ -57,6 +57,13 @@ CREATE TABLE IF NOT EXISTS participants (
     PRIMARY KEY (raffle_id, user_id)
 );
 
+-- 「还没发布就先设好」的待用配图：一个群最多一张，发布时被认领走。
+CREATE TABLE IF NOT EXISTS pending_posters (
+    group_id   TEXT PRIMARY KEY,
+    poster     TEXT    NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS raffle_keys (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     raffle_id   INTEGER NOT NULL,
@@ -690,14 +697,43 @@ class LotteryDB:
         )
 
     def list_poster_keys(self) -> set[str]:
-        """列出所有还挂着配图的场次，键形如 ``"123456-3"``。
+        """列出所有还被引用的配图，键形如 ``"123456-3"`` / ``"pending-123456"``。
 
         用于清理已经随历史裁剪掉的场次留下的图片文件。
         """
         rows = self._query(
             "SELECT group_id, seq FROM raffles WHERE COALESCE(poster, '') <> ''",
         )
-        return {f"{row['group_id']}-{int(row['seq'] or 0)}" for row in rows}
+        keys = {f"{row['group_id']}-{int(row['seq'] or 0)}" for row in rows}
+        # 待用配图还没被任何场次引用，但也不能被当成孤儿删掉
+        pending = self._query("SELECT group_id FROM pending_posters")
+        keys.update(f"pending-{row['group_id']}" for row in pending)
+        return keys
+
+    def set_pending_poster(self, group_id: str, poster: str) -> None:
+        """记录该群的待用配图（同群覆盖）。"""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO pending_posters (group_id, poster, updated_at) "
+            "VALUES (?, ?, ?)",
+            (str(group_id), str(poster), int(time.time())),
+        )
+        self._conn.commit()
+
+    def get_pending_poster(self, group_id: str) -> str:
+        """取该群的待用配图相对路径，没有则返回空串。"""
+        rows = self._query(
+            "SELECT poster FROM pending_posters WHERE group_id = ?",
+            (str(group_id),),
+        )
+        return str(rows[0]["poster"]) if rows else ""
+
+    def clear_pending_poster(self, group_id: str) -> None:
+        """清掉该群的待用配图记录。"""
+        self._conn.execute(
+            "DELETE FROM pending_posters WHERE group_id = ?",
+            (str(group_id),),
+        )
+        self._conn.commit()
 
     def prune_history(self, per_group_limit: int = 200) -> int:
         """按群裁剪历史开奖记录，返回删除的场次数。

@@ -190,22 +190,13 @@ def resolve_path(data_dir: str | Path, rel: str) -> Path | None:
     return target if target.is_file() else None
 
 
-def save_poster(
-    data_dir: str | Path,
-    group_id: str,
-    seq: int,
-    data: bytes,
-) -> str:
-    """压缩并保存配图，返回数据库要存的相对路径。
+def pending_stem(group_id: str) -> str:
+    """待用配图（还没发布时先设好的那张）的文件名主干。"""
+    return f"pending-{group_id}"
 
-    Args:
-        data_dir: 插件数据目录。
-        group_id: 群号（用于命名）。
-        seq: 群内期号（用于命名）。
-        data: 原始图片字节。
 
-    Returns:
-        相对路径，例如 ``covers/123456-3.jpg``。
+def _write_as(data_dir: str | Path, stem: str, data: bytes) -> str:
+    """压缩并写盘，返回相对路径。
 
     Raises:
         ValueError: 图片为空、无法识别、或压缩后依然过大。
@@ -227,24 +218,97 @@ def save_poster(
 
     directory = covers_dir(data_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    delete_poster(data_dir, group_id, seq)  # 换图时清掉旧后缀的残留
-    (directory / f"{_file_stem(group_id, seq)}.{ext}").write_bytes(packed)
-    return rel_path(group_id, seq, ext)
+    _delete_stem(data_dir, stem)  # 换图时清掉旧后缀的残留
+    (directory / f"{stem}.{ext}").write_bytes(packed)
+    return f"{COVERS_DIRNAME}/{stem}.{ext}"
 
 
-def delete_poster(data_dir: str | Path, group_id: str, seq: int) -> int:
-    """删掉一场抽奖的配图（含可能存在的其它后缀），返回删除的文件数。"""
+def save_poster(
+    data_dir: str | Path,
+    group_id: str,
+    seq: int,
+    data: bytes,
+) -> str:
+    """压缩并保存某一场抽奖的配图，返回数据库要存的相对路径。
+
+    Args:
+        data_dir: 插件数据目录。
+        group_id: 群号（用于命名）。
+        seq: 群内期号（用于命名）。
+        data: 原始图片字节。
+
+    Returns:
+        相对路径，例如 ``covers/123456-3.jpg``。
+    """
+    return _write_as(data_dir, _file_stem(group_id, seq), data)
+
+
+def save_pending(data_dir: str | Path, group_id: str, data: bytes) -> str:
+    """保存「还没发布就先设好」的配图。
+
+    群最多只会有一场进行中的抽奖，所以「先设海报再发布」是更自然的使用顺序：
+    这张图先挂在群上，等下一场抽奖发布时被认领走（``adopt``），不会自动过期，
+    也不需要管理员记得清理。
+    """
+    return _write_as(data_dir, pending_stem(group_id), data)
+
+
+def _delete_stem(data_dir: str | Path, stem: str) -> int:
     directory = covers_dir(data_dir)
     if not directory.is_dir():
         return 0
     removed = 0
-    for path in directory.glob(f"{_file_stem(group_id, seq)}.*"):
+    for path in directory.glob(f"{stem}.*"):
         try:
             path.unlink()
             removed += 1
         except OSError as exc:  # pragma: no cover - 权限等异常不该影响抽奖
             logger.warning(f"[群抽奖] 配图删除失败（{path.name}）：{exc}")
     return removed
+
+
+def delete_poster(data_dir: str | Path, group_id: str, seq: int) -> int:
+    """删掉一场抽奖的配图（含可能存在的其它后缀），返回删除的文件数。"""
+    return _delete_stem(data_dir, _file_stem(group_id, seq))
+
+
+def delete_pending(data_dir: str | Path, group_id: str) -> int:
+    """删掉该群的待用配图。"""
+    return _delete_stem(data_dir, pending_stem(group_id))
+
+
+def adopt(
+    data_dir: str | Path,
+    rel: str,
+    group_id: str,
+    seq: int,
+) -> str | None:
+    """把一张已落盘的配图挪到某一场抽奖名下（只改文件名，不重新编码）。
+
+    Args:
+        data_dir: 插件数据目录。
+        rel: 原相对路径（通常是待用配图）。
+        group_id: 目标场次所在群。
+        seq: 目标场次的群内期号。
+
+    Returns:
+        新的相对路径；原文件不存在时返回 ``None``。
+    """
+    source = resolve_path(data_dir, rel)
+    if source is None:
+        return None
+    ext = source.suffix.lstrip(".").lower() or "jpg"
+    directory = covers_dir(data_dir)
+    target = directory / f"{_file_stem(group_id, seq)}.{ext}"
+    if target.resolve() == source.resolve():
+        return rel_path(group_id, seq, ext)
+    delete_poster(data_dir, group_id, seq)
+    try:
+        source.replace(target)
+    except OSError as exc:
+        logger.warning(f"[群抽奖] 配图挪位失败（{source.name}）：{exc}")
+        return None
+    return rel_path(group_id, seq, ext)
 
 
 def sweep(data_dir: str | Path, keep_stems: set[str]) -> int:
@@ -361,5 +425,26 @@ async def store_from_url(
     group_id: str,
     seq: int,
 ) -> str:
-    """下载链接里的图片并保存，返回相对路径。"""
+    """下载链接里的图片并保存为某一场的配图，返回相对路径。"""
     return save_poster(data_dir, group_id, seq, await fetch_bytes(from_url(url)))
+
+
+async def store_pending_from_event(
+    event: Any,
+    data_dir: str | Path,
+    group_id: str,
+) -> str | None:
+    """事件里带图就存成待用配图，返回相对路径；没带图返回 ``None``。"""
+    component = extract_image(event)
+    if component is None:
+        return None
+    return save_pending(data_dir, group_id, await fetch_bytes(component))
+
+
+async def store_pending_from_url(
+    url: str,
+    data_dir: str | Path,
+    group_id: str,
+) -> str:
+    """下载链接里的图片并保存成待用配图，返回相对路径。"""
+    return save_pending(data_dir, group_id, await fetch_bytes(from_url(url)))

@@ -902,17 +902,44 @@ class GroupLotteryPlugin(Star):
                 prize_kind=KIND_KEY if spec.private_notify else KIND_CONTACT,
             )
 
-        # 发布时回复了一张图，就把它当作本场的奖品配图（存不下来不影响发布）
+        # 配图来源优先级：本条消息的图片 > 命令里的「海报 <链接>」 > 该群的待用配图
         poster_error = ""
+        poster_seq = int((self.db.get_raffle(raffle_id) or {}).get("seq") or 0)
+        stored = None
         try:
             stored = await poster.store_from_event(
                 event,
                 self.data_dir,
                 group_id,
-                int((self.db.get_raffle(raffle_id) or {}).get("seq") or 0),
+                poster_seq,
             )
         except Exception as exc:
             stored, poster_error = None, str(exc)
+
+        if stored is None and spec.poster_url:
+            if poster.parse_url(spec.poster_url) is None:
+                poster_error = "「海报」后面要跟 http/https 图片链接"
+            else:
+                try:
+                    stored = await poster.store_from_url(
+                        spec.poster_url,
+                        self.data_dir,
+                        group_id,
+                        poster_seq,
+                    )
+                except Exception as exc:
+                    stored, poster_error = None, str(exc)
+
+        if stored is None:
+            pending = self.db.get_pending_poster(group_id)
+            if pending:
+                adopted = poster.adopt(self.data_dir, pending, group_id, poster_seq)
+                if adopted:
+                    stored = adopted
+                    self.db.clear_pending_poster(group_id)
+                elif not poster_error:
+                    poster_error = "之前设好的配图文件已经找不到了，请重新发一张"
+
         if stored:
             self.db.update_raffle(raffle_id, poster=stored)
         raffle = self.db.get_raffle(raffle_id) or {}
@@ -1000,7 +1027,7 @@ class GroupLotteryPlugin(Star):
         )
         if not stored:
             lines.append(
-                f"· 抽奖 海报 {group_id} —— 回复一张奖品截图后发送，给公告配图"
+                f"· 抽奖 海报 {group_id} —— 回复一张奖品截图后发送；也可以发布时直接写「海报 <链接>」"
                 if from_private
                 else "· 回复一张奖品截图后发送「抽奖 海报」—— 给公告和提醒配图"
             )
@@ -1277,6 +1304,10 @@ class GroupLotteryPlugin(Star):
         * 把图片和命令写在同一条消息里；
         * 在命令后面直接写图片链接，由 AstrBot 去下载。
 
+        **顺序随便**：群里还没有进行中的抽奖时，这张图会先存成该群的**待用配图**，
+        等下一场抽奖发布时自动带上（用掉就没了，不需要手动清空）。已经有进行中的
+        抽奖时则直接换图，并重新播报一次公告 —— 公告早就发过了也不影响。
+
         图片统一压到最长边 1280 后存进插件数据目录，之后**发布公告**与**群内
         定时提醒**都会带上它。发送时不依赖协议端读本地文件——aiocqhttp 适配器
         会把图片转成 base64 发出去。
@@ -1290,41 +1321,85 @@ class GroupLotteryPlugin(Star):
             or peek_head in _KEY_VIEW_WORDS
             or peek_head in _KEY_CLEAR_WORDS
         )
-        umo, group_id, _name, body = await self._target(
+        umo, group_id, group_name, body = await self._target(
             event, tail, allow_default=read_like
         )
-        raffle = self._require_open_raffle(umo)
-        raffle_id = int(raffle["id"])
-        seq = texts.raffle_no(raffle)
+        # 这里刻意不用 _require_open_raffle：「先设海报、再发布」是更自然的顺序
+        raffle = self._open_raffle(umo)
+        label = texts.raffle_label(raffle) if raffle else f"群 {group_id} 的下一场"
         suffix = f"（私聊写法：抽奖 海报 {group_id}）" if from_private else ""
 
         if body in _KEY_CLEAR_WORDS:
-            removed = poster.delete_poster(self.data_dir, group_id, seq)
-            self.db.update_raffle(raffle_id, poster="")
+            removed = 0
+            if raffle:
+                removed += poster.delete_poster(
+                    self.data_dir, group_id, texts.raffle_no(raffle)
+                )
+                self.db.update_raffle(int(raffle["id"]), poster="")
+            self.db.clear_pending_poster(group_id)
+            removed += poster.delete_pending(self.data_dir, group_id)
             yield event.plain_result(
-                f"🗑️ 已清除{texts.raffle_label(raffle)}的奖品配图"
-                + ("。" if removed else "（本来就没有）。")
+                f"🗑️ 已清除{label}的奖品配图"
+                + ("。" if removed else "（本来就没有）。"),
             )
             return
 
         component = poster.extract_image(event)
         url = poster.parse_url(body)
         if body in _KEY_VIEW_WORDS or (not body and component is None):
-            current = str(raffle.get("poster") or "")
-            lines = [
-                f"🖼️ {texts.raffle_label(raffle)}的奖品配图：{'已设置' if current else '未设置'}",
-            ]
+            current = str((raffle or {}).get("poster") or "")
+            pending = self.db.get_pending_poster(group_id)
+            if current:
+                state = "已设置"
+            elif pending:
+                state = "已设置（待用，下一场发布时带上）"
+            else:
+                state = "未设置"
+            lines = [f"🖼️ {label}的奖品配图：{state}"]
             if current:
                 lines.append(f"文件：{current}")
+            if pending:
+                lines.append(f"待用文件：{pending}")
             lines.append("")
             lines.append(
                 "设置：回复一张图片后发送本命令，或 抽奖 海报 <图片链接>" + suffix
             )
-            if current:
+            if raffle is None:
+                lines.append("现在还没有进行中的抽奖，设好之后发布会自动带上。")
+            if current or pending:
                 lines.append("清除：抽奖 海报 清空" + suffix)
             yield event.plain_result("\n".join(lines))
             return
 
+        # 还没有进行中的抽奖 → 先挂在该群上，等下一场发布时认领
+        if raffle is None:
+            if url is not None:
+                stored = await poster.store_pending_from_url(
+                    url,
+                    self.data_dir,
+                    group_id,
+                )
+            else:
+                stored = await poster.store_pending_from_event(
+                    event,
+                    self.data_dir,
+                    group_id,
+                )
+            if stored is None:
+                raise ValueError(
+                    "没有看到图片。请**回复**一张图片后再发送本命令，"
+                    "或者把图片链接写在命令后面，例如：\n"
+                    f"抽奖 海报 {group_id} https://example.com/prize.png",
+                )
+            self.db.set_pending_poster(group_id, stored)
+            self._sweep_posters()
+            yield event.plain_result(
+                f"🖼️ 已存好群 {group_id} 的奖品配图（{stored}）。\n"
+                "下一场抽奖发布时会自动带上它，之后不用再清空。"
+            )
+            return
+
+        seq = texts.raffle_no(raffle)
         if url is not None:
             rel = await poster.store_from_url(url, self.data_dir, group_id, seq)
         else:
@@ -1336,11 +1411,24 @@ class GroupLotteryPlugin(Star):
                 )
             rel = await poster.store_from_event(event, self.data_dir, group_id, seq)
 
-        self.db.update_raffle(raffle_id, poster=rel or "")
+        self.db.update_raffle(int(raffle["id"]), poster=rel or "")
         self._sweep_posters()
+        raffle = self.db.get_raffle(int(raffle["id"])) or raffle
+        # 公告早就发过了，重新播报一次才能让群里真的看到这张图（刻意不 @全体成员）
+        announced = await send_group_text(
+            self.context,
+            umo,
+            texts.build_publish_notice(raffle, group_id, group_name),
+            allow_at=False,
+            images=self._poster_images(raffle),
+        )
         yield event.plain_result(
             f"🖼️ 已为{texts.raffle_label(raffle)}设置奖品配图（{rel}）。\n"
-            "之后的群内提醒会带上它。"
+            + (
+                "已重新在群里播报一次公告（不带 @全体成员），之后的群内提醒也会带上它。"
+                if announced
+                else "⚠️ 群内重新播报失败，之后的群内提醒仍会带上它。"
+            )
         )
 
     async def _h_full(

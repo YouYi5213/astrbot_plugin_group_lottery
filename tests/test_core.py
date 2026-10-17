@@ -720,6 +720,38 @@ def test_parse_publish_relative_time_and_off_switches():
     assert spec.private_notify is False
 
 
+def test_parse_publish_poster_option():
+    """长命令可以顺手带上海报链接（用户给的例子那种写法）。"""
+    spec = parse_publish(
+        "Steam游戏转生魔塔CDK 1 定时 18:18 满员 3 说明 What can i say "
+        "海报 https://example.com/prize.png",
+    )
+    assert spec.title == "Steam游戏转生魔塔CDK"
+    assert spec.winner_count == 1
+    assert spec.draw_at_text == "18:18"
+    assert spec.min_players == 3
+    assert spec.description == "What can i say"
+    assert spec.poster_url == "https://example.com/prize.png"
+
+
+def test_parse_publish_poster_terminates_description():
+    """「海报」是值的终止符：说明不能把链接一起吞掉，也不能反过来。"""
+    spec = parse_publish("月卡 说明 手慢无 海报 https://x/y.png")
+    assert spec.description == "手慢无"
+    assert spec.poster_url == "https://x/y.png"
+
+    spec = parse_publish("月卡 海报 https://x/y.png 说明 手慢无")
+    assert spec.poster_url == "https://x/y.png"
+    assert spec.description == "手慢无"
+
+
+def test_parse_publish_poster_requires_a_link():
+    with pytest.raises(PublishParseError, match="海报"):
+        parse_publish("月卡 海报")
+    with pytest.raises(PublishParseError, match="海报"):
+        parse_publish("月卡 海报 名额 2")
+
+
 def test_parse_publish_rejects_bad_input():
     with pytest.raises(PublishParseError):
         parse_publish("")
@@ -878,6 +910,46 @@ def test_list_poster_keys_only_returns_configured_raffles(db):
     db.update_raffle(with_poster, poster="")
     assert db.list_poster_keys() == set()
     assert db.get_raffle(plain)["poster"] == ""
+
+
+def test_pending_poster_record_round_trip(db):
+    """待用配图一个群最多一张，覆盖式写入。"""
+    assert db.get_pending_poster("888888") == ""
+
+    db.set_pending_poster("888888", "covers/pending-888888.jpg")
+    db.set_pending_poster("888888", "covers/pending-888888.png")
+    db.set_pending_poster("999999", "covers/pending-999999.jpg")
+
+    assert db.get_pending_poster("888888") == "covers/pending-888888.png"
+    assert db.get_pending_poster("999999") == "covers/pending-999999.jpg"
+    # 待用配图也要算「还在用」，否则会被清理当孤儿删掉
+    assert db.list_poster_keys() == {"pending-888888", "pending-999999"}
+
+    db.clear_pending_poster("888888")
+    assert db.get_pending_poster("888888") == ""
+    assert db.get_pending_poster("") == ""
+    assert db.list_poster_keys() == {"pending-999999"}
+
+
+def test_pending_poster_table_created_for_legacy_database():
+    """老库升级后应该自动有 pending_posters 表。"""
+    workdir = Path(__file__).resolve().parent / ".tmp"
+    workdir.mkdir(parents=True, exist_ok=True)
+    db_path = workdir / f"legacy_pending_{random.getrandbits(32):08x}.db"
+    database = LotteryDB(db_path)
+    database._conn.execute("DROP TABLE pending_posters")
+    database._conn.commit()
+    database.close()
+
+    reopened = LotteryDB(db_path)
+    reopened.set_pending_poster("888888", "covers/pending-888888.jpg")
+    assert reopened.get_pending_poster("888888") == "covers/pending-888888.jpg"
+    reopened.close()
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            Path(str(db_path) + suffix).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _raffle_stub(**overrides):
@@ -1096,6 +1168,52 @@ def test_sweep_removes_orphans(poster_dir):
 
     assert poster.sweep(poster_dir, {"888888-2"}) == 1
     assert [p.name for p in (poster_dir / "covers").iterdir()] == ["888888-2.jpg"]
+
+
+def test_save_and_delete_pending_poster(poster_dir):
+    rel = poster.save_pending(poster_dir, "888888", _png())
+
+    assert rel == "covers/pending-888888.jpg"
+    assert poster.resolve_path(poster_dir, rel) is not None
+    assert poster.pending_stem("888888") == "pending-888888"
+
+    assert poster.delete_pending(poster_dir, "888888") == 1
+    assert (poster_dir / "covers").exists() is False or not list(
+        (poster_dir / "covers").iterdir()
+    )
+
+
+def test_adopt_moves_pending_poster_under_a_raffle(poster_dir):
+    """发布时把待用配图改名到该场名下，不重新编码。"""
+    pending = poster.save_pending(poster_dir, "888888", _png())
+    before = poster.resolve_path(poster_dir, pending)
+    assert before is not None
+
+    rel = poster.adopt(poster_dir, pending, "888888", 3)
+
+    assert rel == "covers/888888-3.jpg"
+    assert not before.exists()
+    assert [p.name for p in (poster_dir / "covers").iterdir()] == ["888888-3.jpg"]
+
+
+def test_adopt_replaces_existing_and_survives_missing(poster_dir):
+    """认领时清掉本场旧图；源文件丢了就返回 None。"""
+    poster.save_poster(poster_dir, "888888", 3, _png())
+    pending = poster.save_pending(poster_dir, "888888", _png())
+
+    assert poster.adopt(poster_dir, pending, "888888", 3) == "covers/888888-3.jpg"
+    assert [p.name for p in (poster_dir / "covers").iterdir()] == ["888888-3.jpg"]
+
+    assert poster.adopt(poster_dir, "covers/pending-888888.jpg", "888888", 4) is None
+
+
+def test_sweep_keeps_pending_stem(poster_dir):
+    """清理时要把待用配图当作「还在用」。"""
+    poster.save_poster(poster_dir, "888888", 1, _png())
+    poster.save_pending(poster_dir, "888888", _png())
+
+    assert poster.sweep(poster_dir, {"pending-888888"}) == 1
+    assert [p.name for p in (poster_dir / "covers").iterdir()] == ["pending-888888.jpg"]
 
 
 class _FakeImageEvent:

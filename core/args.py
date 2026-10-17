@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from .models import MAX_WINNERS
 
 # 一行式发布支持的选项关键字（也是「值」的终止符）
-OPTION_KEYWORDS = ("名额", "定时", "满员", "私聊", "说明")
+OPTION_KEYWORDS = ("名额", "定时", "满员", "私聊", "说明", "海报")
 
 # 「关 / 开」类输入
 OFF_WORDS = {"关", "关闭", "off", "false", "0", "取消", "无", "不"}
@@ -43,6 +43,7 @@ class PublishSpec:
     min_players: int | None = None
     private_notify: bool | None = None
     description: str = ""
+    poster_url: str = ""
     # 解析过程中发现但不致命的问题，交由上层提示
     warnings: list[str] = field(default_factory=list)
 
@@ -164,6 +165,13 @@ def _parse_options(spec: PublishSpec, tokens: list[str]) -> None:
             if len(value) > MAX_DESC_LEN:
                 raise PublishParseError(f"说明过长（{MAX_DESC_LEN} 字以内）")
             spec.description = value
+        elif keyword == "海报":
+            if not value:
+                raise PublishParseError(
+                    "「海报」后面要跟图片链接，例如：海报 https://example.com/prize.png"
+                    "（也可以回复一张图片后再发布）"
+                )
+            spec.poster_url = value
         else:  # pragma: no cover - 关键字表与分支一一对应
             spec.warnings.append(f"未知选项：{keyword}")
 
